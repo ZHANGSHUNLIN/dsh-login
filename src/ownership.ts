@@ -6,7 +6,7 @@ import { dirname } from 'node:path'
 const SAVE_DEBOUNCE_MS = 200
 
 /**
- * Sidecar sessionId → username index, one JSON object per data file.
+ * Sidecar sessionId → stable Admin userId index, one JSON object per data file.
  * In-memory map is authoritative for the running process; the file is a
  * restart survival best-effort. Direct index hits only — lineage resolution
  * lives in api-filter (it needs session summaries).
@@ -21,17 +21,18 @@ export class OwnershipIndex {
     // become admin-only until re-attributed, never cross-visible.
     try {
       const raw = readFileSync(filePath, 'utf8')
-      const parsed = JSON.parse(raw) as Record<string, unknown>
-      if (parsed !== null && typeof parsed === 'object') {
-        for (const [k, v] of Object.entries(parsed)) {
+      const parsed = JSON.parse(raw) as { version?: unknown; owners?: Record<string, unknown> }
+      // Username-keyed records cannot be mapped safely to Admin IDs.
+      if (parsed?.version === 2 && parsed.owners !== null && typeof parsed.owners === 'object') {
+        for (const [k, v] of Object.entries(parsed.owners)) {
           if (typeof v === 'string') this.map.set(k, v)
         }
       }
     } catch { /* absent or corrupt: start empty */ }
   }
 
-  record(sessionId: string, username: string): void {
-    this.map.set(sessionId, username)
+  record(sessionId: string, userId: string): void {
+    this.map.set(sessionId, userId)
     this.scheduleSave()
   }
 
@@ -73,7 +74,7 @@ export class OwnershipIndex {
   private async writeNow(): Promise<void> {
     try {
       await mkdir(dirname(this.filePath), { recursive: true })
-      await writeFile(this.filePath, `${JSON.stringify(Object.fromEntries(this.map))}\n`, 'utf8')
+      await writeFile(this.filePath, `${JSON.stringify({ version: 2, owners: Object.fromEntries(this.map) })}\n`, 'utf8')
     } catch { /* persistence is best-effort; memory stays authoritative */ }
   }
 }

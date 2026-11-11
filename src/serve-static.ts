@@ -87,6 +87,11 @@ export async function serveStatic(
     res.end()
     return
   }
-  res.writeHead(200, { 'content-type': type })
+  const headers: Record<string, string> = { 'content-type': type }
+  if (target === distRoot || target === distIndex) {
+    headers['cache-control'] = 'no-store, no-cache, must-revalidate'
+    headers.pragma = 'no-cache'
+  }
+  res.writeHead(200, headers)
   res.end(body)
 }

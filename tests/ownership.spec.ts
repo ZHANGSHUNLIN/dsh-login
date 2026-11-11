@@ -18,7 +18,7 @@ describe('OwnershipIndex', () => {
     await idx.flush()
     const reloaded = new OwnershipIndex(file)
     expect(reloaded.lookup('s1')).toBe('alice')
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ s1: 'alice' })
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 2, owners: { s1: 'alice' } })
   })
 
   it('re-record overwrites, corrupt file starts empty', async () => {

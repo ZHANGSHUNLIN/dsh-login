@@ -1,11 +1,12 @@
 // src/index.ts
 import { join as join4 } from "node:path";
-import { credentialRef } from "@deepseek-ai/dsh-credentials";
 
 // src/config.ts
 import z from "@deepseek-ai/schemastery";
 var Config = z.object({
-  password: z.string().required(),
+  adminBaseUrl: z.string().default("http://127.0.0.1:8080/admin"),
+  adminClientId: z.string().default("dsh"),
+  publicBaseUrl: z.string().default(""),
   distIndex: z.string().default(""),
   dataDir: z.string().default(""),
   sessionTtl: z.natural().default(604800),
@@ -39,14 +40,32 @@ var SessionStore = class {
   store = /* @__PURE__ */ new Map();
   saveTimer;
   saving = Promise.resolve();
-  /** Generate a 32-byte random token for `user` with its admin flag. */
-  create(user, isAdmin) {
+  /** Generate a 32-byte random DSH token for an Admin user ID. */
+  create(user, isAdmin, permissions = []) {
     const token = randomBytes(32).toString("hex");
     const createdAt = Date.now();
-    const session = { token, user, isAdmin, createdAt, expiresAt: createdAt + this.ttlSeconds * 1e3 };
+    const session = {
+      token,
+      user,
+      isAdmin,
+      permissions: [...new Set(permissions)],
+      authSource: "admin-sso",
+      createdAt,
+      expiresAt: createdAt + this.ttlSeconds * 1e3
+    };
     this.store.set(token, session);
     this.scheduleSave();
     return session;
+  }
+  updatePermissionsForUser(user, permissions) {
+    const next = [...new Set(permissions)];
+    let changed = false;
+    for (const [token, session] of this.store) {
+      if (session.user !== user) continue;
+      this.store.set(token, { ...session, permissions: next });
+      changed = true;
+    }
+    if (changed) this.scheduleSave();
   }
   /** Return the live session for a token, or undefined. */
   verify(token) {
@@ -60,13 +79,29 @@ var SessionStore = class {
     }
     return session;
   }
+  lookupUser(token) {
+    return this.verify(token)?.user;
+  }
+  hasUser(userId) {
+    for (const token of this.store.keys()) {
+      const session = this.verify(token);
+      if (session?.user === userId) return true;
+    }
+    return false;
+  }
+  permissionsForUser(userId) {
+    for (const session of this.store.values()) {
+      if (session.user === userId && Date.now() <= session.expiresAt) return [...session.permissions];
+    }
+    return [];
+  }
   /** Remove a session. Revoking an unknown token is a no-op. */
   revoke(token) {
     if (this.store.delete(token)) this.scheduleSave();
   }
   /**
-   * Revoke every live session belonging to `user` (user removal or password
-   * change). Returns the number of sessions removed.
+   * Revoke every live session belonging to an Admin user ID. Returns the
+   * number of sessions removed.
    */
   revokeAllFor(user) {
     let removed = 0;
@@ -80,8 +115,7 @@ var SessionStore = class {
     return removed;
   }
   /**
-   * Count live (unexpired) sessions per username. Used by the admin user
-   * list to report online status; expired entries are swept along the way.
+   * Count live (unexpired) sessions per Admin user ID.
    */
   onlineCounts() {
     const counts = /* @__PURE__ */ new Map();
@@ -128,10 +162,18 @@ var SessionStore = class {
       for (const entry of list) {
         if (typeof entry !== "object" || entry === null) continue;
         const s = entry;
-        if (typeof s.token !== "string" || typeof s.user !== "string" || typeof s.isAdmin !== "boolean") continue;
+        if (s.authSource !== "admin-sso" || typeof s.token !== "string" || typeof s.user !== "string" || typeof s.isAdmin !== "boolean") continue;
         if (typeof s.createdAt !== "number" || typeof s.expiresAt !== "number") continue;
         if (now > s.expiresAt) continue;
-        this.store.set(s.token, { token: s.token, user: s.user, isAdmin: s.isAdmin, createdAt: s.createdAt, expiresAt: s.expiresAt });
+        this.store.set(s.token, {
+          token: s.token,
+          user: s.user,
+          isAdmin: false,
+          permissions: Array.isArray(s.permissions) ? s.permissions : [],
+          authSource: "admin-sso",
+          createdAt: s.createdAt,
+          expiresAt: s.expiresAt
+        });
       }
     } catch {
     }
@@ -154,99 +196,6 @@ var SessionStore = class {
   }
 };
 
-// src/users.ts
-import { randomBytes as randomBytes2, scryptSync, timingSafeEqual } from "node:crypto";
-var USERNAME_PATTERN = /^[a-zA-Z0-9_-]{1,32}$/;
-var KEY_LEN = 64;
-function hashPassword(password, saltHex) {
-  return scryptSync(password, Buffer.from(saltHex, "hex"), KEY_LEN).toString("hex");
-}
-function constantTimeEqualHex(a, b) {
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(Buffer.from(a, "hex"), Buffer.from(b, "hex"));
-}
-var UserStore = class {
-  constructor(credentials, ref) {
-    this.credentials = credentials;
-    this.ref = ref;
-  }
-  credentials;
-  ref;
-  async list() {
-    const resolved = await this.credentials.resolve(this.ref);
-    if (resolved === void 0) return [];
-    try {
-      const parsed = JSON.parse(resolved.value);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-  async isEmpty() {
-    return (await this.list()).length === 0;
-  }
-  async create(username, password, isAdmin) {
-    if (!USERNAME_PATTERN.test(username)) throw new Error("invalid username");
-    if (password.length === 0) throw new Error("password must not be empty");
-    const records = await this.list();
-    if (records.some((u) => u.username === username)) throw new Error(`user "${username}" already exists`);
-    const salt = randomBytes2(16).toString("hex");
-    const record = {
-      username,
-      salt,
-      hash: hashPassword(password, salt),
-      isAdmin: records.length === 0 ? true : isAdmin,
-      createdAt: Date.now()
-    };
-    await this.credentials.set(this.ref, JSON.stringify([...records, record]));
-    return record;
-  }
-  async verify(username, password) {
-    const record = (await this.list()).find((u) => u.username === username);
-    if (record === void 0) return void 0;
-    if (record.disabled === true) return void 0;
-    return constantTimeEqualHex(hashPassword(password, record.salt), record.hash) ? record : void 0;
-  }
-  /**
-   * Set or clear the disabled flag for `username`. The caller (admin API)
-   * owns the last-enabled-admin guard and session revocation.
-   */
-  async setDisabled(username, disabled) {
-    const records = await this.list();
-    const record = records.find((u) => u.username === username);
-    if (record === void 0) throw new Error(`unknown user "${username}"`);
-    if (disabled) record.disabled = true;
-    else delete record.disabled;
-    await this.credentials.set(this.ref, JSON.stringify(records));
-  }
-  /**
-   * Stamp `lastLoginAt` for a verified login. Best-effort audit field:
-   * unknown users are a silent no-op so this can never fail a login.
-   */
-  async touchLastLogin(username) {
-    const records = await this.list();
-    const record = records.find((u) => u.username === username);
-    if (record === void 0) return;
-    record.lastLoginAt = Date.now();
-    await this.credentials.set(this.ref, JSON.stringify(records));
-  }
-  async setPassword(username, password) {
-    if (password.length === 0) throw new Error("password must not be empty");
-    const records = await this.list();
-    const record = records.find((u) => u.username === username);
-    if (record === void 0) throw new Error(`unknown user "${username}"`);
-    record.salt = randomBytes2(16).toString("hex");
-    record.hash = hashPassword(password, record.salt);
-    await this.credentials.set(this.ref, JSON.stringify(records));
-  }
-  async remove(username) {
-    const records = await this.list();
-    const next = records.filter((u) => u.username !== username);
-    if (next.length === records.length) throw new Error(`unknown user "${username}"`);
-    await this.credentials.set(this.ref, JSON.stringify(next));
-  }
-};
-
 // src/ownership.ts
 import { mkdir as mkdir2, writeFile as writeFile2 } from "node:fs/promises";
 import { readFileSync as readFileSync2 } from "node:fs";
@@ -258,8 +207,8 @@ var OwnershipIndex = class {
     try {
       const raw = readFileSync2(filePath, "utf8");
       const parsed = JSON.parse(raw);
-      if (parsed !== null && typeof parsed === "object") {
-        for (const [k, v] of Object.entries(parsed)) {
+      if (parsed?.version === 2 && parsed.owners !== null && typeof parsed.owners === "object") {
+        for (const [k, v] of Object.entries(parsed.owners)) {
           if (typeof v === "string") this.map.set(k, v);
         }
       }
@@ -270,8 +219,8 @@ var OwnershipIndex = class {
   map = /* @__PURE__ */ new Map();
   saveTimer;
   saving = Promise.resolve();
-  record(sessionId, username) {
-    this.map.set(sessionId, username);
+  record(sessionId, userId) {
+    this.map.set(sessionId, userId);
     this.scheduleSave();
   }
   lookup(sessionId) {
@@ -306,7 +255,7 @@ var OwnershipIndex = class {
   async writeNow() {
     try {
       await mkdir2(dirname2(this.filePath), { recursive: true });
-      await writeFile2(this.filePath, `${JSON.stringify(Object.fromEntries(this.map))}
+      await writeFile2(this.filePath, `${JSON.stringify({ version: 2, owners: Object.fromEntries(this.map) })}
 `, "utf8");
     } catch {
     }
@@ -605,7 +554,12 @@ async function serveStatic(pathname, res, distRoot, distIndex, authorizeIndex, r
     res.end();
     return;
   }
-  res.writeHead(200, { "content-type": type });
+  const headers = { "content-type": type };
+  if (target === distRoot || target === distIndex) {
+    headers["cache-control"] = "no-store, no-cache, must-revalidate";
+    headers.pragma = "no-cache";
+  }
+  res.writeHead(200, headers);
   res.end(body);
 }
 
@@ -620,9 +574,6 @@ function extractSessionToken(cookieHeader) {
     }
   }
   return void 0;
-}
-function buildCookieHeader(token, ttlSeconds) {
-  return `${COOKIE_NAME}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${String(ttlSeconds)}`;
 }
 function buildClearCookieHeader() {
   return `${COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`;
@@ -946,14 +897,132 @@ function isKnownWireMethod(method) {
   return WIRE_SURFACE.has(method);
 }
 
-// src/capabilities.ts
-function userAllowedMethods() {
-  return [...USER_ALLOWED];
+// src/dsh-permissions.ts
+var DSH_PERMISSIONS = {
+  settings: "dsh:settings:manage",
+  plugins: "dsh:plugin:manage",
+  agentPresets: "dsh:agent-preset:manage"
+};
+var CORE_UI_PLUGINS = [
+  "@islibaodong/dsh-login",
+  "@duhome/dsh-admin-mcp",
+  // The settings shell owns the launcher slot used by the Admin account
+  // card. Its privileged sections are gated independently.
+  "@deepseek-ai/dsh-client-ui-settings-general"
+];
+var METHOD_PERMISSIONS = new Map([
+  ...[
+    "settings.describe",
+    "settings.mutate",
+    "settings.openSettingsDocument",
+    "settings.replace",
+    "settings.update"
+  ].map((method) => [method, DSH_PERMISSIONS.settings]),
+  ...[
+    "agentPresets.list",
+    "agentPresets.read",
+    "agentPresets.select",
+    // The preset UI's Remote contract uses the singular namespace. Listing,
+    // selecting, reading and editing the preset roster are covered by the
+    // same Admin-managed permission; opening a host document is not.
+    "agentPreset.list",
+    "agentPreset.select",
+    "agentPreset.read",
+    "agentPreset.copy",
+    "agentPreset.remove"
+  ].map((method) => [method, DSH_PERMISSIONS.agentPresets]),
+  ...[
+    "pluginManager.cancelInstall",
+    "pluginManager.inspect",
+    "pluginManager.installBundle",
+    "pluginManager.listBundles",
+    "pluginManager.listPlugins",
+    "pluginManager.listVersionExemptions",
+    "pluginManager.listVersions",
+    "pluginManager.readBundleDetail",
+    "pluginManager.registries",
+    "pluginManager.removeBundle",
+    "pluginManager.setBundleEnabled",
+    "pluginManager.setPluginEnabled",
+    "pluginManager.setVersionExemption",
+    "pluginManager.updateBundle",
+    "pluginManager.waitForInstall",
+    "pluginMarket.listIndexes",
+    "pluginMarket.readEntryDetail",
+    "pluginMarket.search",
+    "pluginMarket.setIndexes",
+    "pluginInventory.list",
+    "pluginRegistryProbe.fastest"
+  ].map((method) => [method, DSH_PERMISSIONS.plugins])
+]);
+var UI_PLUGIN_PERMISSIONS = {
+  "@deepseek-ai/dsh-client-ui-plugin-manager": [DSH_PERMISSIONS.plugins],
+  "@deepseek-ai/dsh-client-ui-settings-plugin-inventory": [DSH_PERMISSIONS.plugins],
+  "@deepseek-ai/dsh-client-ui-settings-plugins": [DSH_PERMISSIONS.plugins],
+  "@deepseek-ai/dsh-client-ui-entry-customization": [DSH_PERMISSIONS.plugins],
+  "@deepseek-ai/dsh-client-ui-settings-models": [DSH_PERMISSIONS.settings],
+  "@deepseek-ai/dsh-client-ui-settings-shell": [DSH_PERMISSIONS.settings],
+  "@deepseek-ai/dsh-client-ui-settings-agent-loop": [DSH_PERMISSIONS.settings],
+  "@deepseek-ai/dsh-client-ui-settings-subagent": [DSH_PERMISSIONS.settings],
+  "@deepseek-ai/dsh-client-ui-settings-web-search": [DSH_PERMISSIONS.settings],
+  "@deepseek-ai/dsh-client-ui-settings-session-log": [DSH_PERMISSIONS.settings],
+  "@linxin666/dsh-client-ui-plugin-manager": [DSH_PERMISSIONS.plugins],
+  "@linxin666/dsh-client-ui-market": [DSH_PERMISSIONS.plugins],
+  "@linxin666/dsh-client-ui-community-plugins": [DSH_PERMISSIONS.plugins],
+  "@linxin666/dsh-client-ui-web-ui-settings": [DSH_PERMISSIONS.settings],
+  "@tencent-connect/dsh-qqbot": [DSH_PERMISSIONS.settings]
+};
+function hasDshPermission(user, permission) {
+  return user.isAdmin || user.permissions?.includes(permission) === true;
 }
+function permissionForUiPlugin(plugin) {
+  const mapped = UI_PLUGIN_PERMISSIONS[plugin];
+  if (mapped) return mapped[0];
+  if (plugin.startsWith("@deepseek-ai/dsh-client-ui-settings-") && plugin !== "@deepseek-ai/dsh-client-ui-settings-general") return DSH_PERMISSIONS.settings;
+  return /agent[-.]?preset/i.test(plugin) ? DSH_PERMISSIONS.agentPresets : void 0;
+}
+function canUseWireMethod(method, user) {
+  if (user.isAdmin || USER_ALLOWED.has(method)) return true;
+  const required = METHOD_PERMISSIONS.get(method);
+  return required !== void 0 && hasDshPermission(user, required);
+}
+function permittedWireMethods(user) {
+  return user.isAdmin ? [...USER_ALLOWED, ...ADMIN_ONLY_METHODS] : [
+    ...USER_ALLOWED,
+    ...[...ADMIN_ONLY_METHODS].filter((method) => canUseWireMethod(method, user))
+  ];
+}
+function permittedUiPlugins(plugins, user) {
+  if (user.isAdmin) return [...plugins];
+  return plugins.filter((plugin) => {
+    if (CORE_UI_PLUGINS.includes(plugin)) return true;
+    const required = permissionForUiPlugin(plugin);
+    return required !== void 0 && hasDshPermission(user, required);
+  });
+}
+function permissionForWireMethod(method) {
+  return METHOD_PERMISSIONS.get(method);
+}
+
+// src/capabilities.ts
 var USER_DOMAINS = [
   ...new Set([...USER_ALLOWED].map((method) => method.slice(0, method.indexOf("."))))
 ].sort();
 var ADMIN_ONLY_UI_PLUGINS = [
+  // DSH 0.2.2 built-in admin surfaces.
+  "@deepseek-ai/dsh-client-ui-plugin-manager",
+  "@deepseek-ai/dsh-client-ui-settings-plugin-inventory",
+  "@deepseek-ai/dsh-client-ui-settings-plugins",
+  "@deepseek-ai/dsh-client-ui-agent-preset",
+  "@deepseek-ai/dsh-client-ui-entry-customization",
+  "@deepseek-ai/dsh-client-ui-settings-models",
+  "@deepseek-ai/dsh-client-ui-settings-shell",
+  "@deepseek-ai/dsh-client-ui-settings-agent-loop",
+  "@deepseek-ai/dsh-client-ui-settings-subagent",
+  "@deepseek-ai/dsh-client-ui-settings-web-search",
+  "@deepseek-ai/dsh-client-ui-settings-session-log",
+  "@tencent-connect/dsh-qqbot",
+  // Older community bundle ids kept for mixed-version profiles.
   "@linxin666/dsh-client-ui-plugin-manager",
   "@linxin666/dsh-client-ui-skill-explorer",
   "@linxin666/dsh-client-ui-skin-center",
@@ -970,38 +1039,27 @@ var ADMIN_ONLY_UI_PLUGINS = [
   "@linxin666/dsh-perf",
   "@linxin666/dsh-liangshen"
 ];
-var CORE_UI_PLUGINS = [
-  "@islibaodong/dsh-login"
-];
 function deriveCapabilities(user) {
-  if (user.isAdmin) {
-    return {
-      methods: userAllowedMethods().concat(adminOnlyMethods()),
-      domains: allDomains(),
-      uiPlugins: CORE_UI_PLUGINS.concat(allUiPlugins())
-    };
-  }
+  const methods = permittedWireMethods(user);
+  const uiPlugins = permittedUiPlugins(CORE_UI_PLUGINS.concat(ADMIN_ONLY_UI_PLUGINS), user);
   return {
-    methods: userAllowedMethods(),
-    domains: [...USER_DOMAINS],
-    uiPlugins: [...CORE_UI_PLUGINS]
+    methods,
+    domains: [...new Set(methods.map((method) => method.slice(0, method.indexOf("."))))].sort(),
+    uiPlugins
   };
-}
-function adminOnlyMethods() {
-  return [...ADMIN_ONLY_METHODS];
-}
-function allDomains() {
-  const admin = [...new Set([...ADMIN_ONLY_METHODS].map((m) => m.slice(0, m.indexOf("."))))];
-  return [.../* @__PURE__ */ new Set([...USER_DOMAINS, ...admin])].sort();
-}
-function allUiPlugins() {
-  return [...CORE_UI_PLUGINS, ...ADMIN_ONLY_UI_PLUGINS];
 }
 
 // src/ui-gate.ts
 var BOOT_MARKER = '<script>globalThis["__DSH_BOOT__"] = ';
-var DENIED_IDS = new Set(ADMIN_ONLY_UI_PLUGINS);
-function filterBootGraph(graph) {
+function deniedUiPlugins(user, pluginIds) {
+  if (user.isAdmin) return /* @__PURE__ */ new Set();
+  return new Set(pluginIds.filter((id) => {
+    if (CORE_UI_PLUGINS.includes(id)) return false;
+    const required = permissionForUiPlugin(id);
+    return required !== void 0 ? !hasDshPermission(user, required) : ADMIN_ONLY_UI_PLUGINS.includes(id);
+  }));
+}
+function filterBootGraph(graph, user = { isAdmin: false }) {
   if (typeof graph !== "object" || graph === null) return null;
   const shape = graph;
   if (typeof shape.rev !== "string" || !Array.isArray(shape.entries) || !Array.isArray(shape.batches)) {
@@ -1009,12 +1067,20 @@ function filterBootGraph(graph) {
   }
   const kept = [];
   const removed = /* @__PURE__ */ new Set();
+  const pluginIds = shape.entries.flatMap((row) => {
+    if (typeof row !== "object" || row === null) return [];
+    const id = row.id;
+    return typeof id === "string" ? [stripClient(id)] : [];
+  });
+  const denied = deniedUiPlugins(user, [...ADMIN_ONLY_UI_PLUGINS, ...pluginIds]);
   for (const row of shape.entries) {
     if (typeof row !== "object" || row === null) return null;
     const entry = row;
     if (typeof entry.id !== "string") return null;
-    if (DENIED_IDS.has(entry.id)) {
+    const pluginId = stripClient(entry.id);
+    if (denied.has(pluginId)) {
       removed.add(entry.id);
+      removed.add(pluginId);
       continue;
     }
     kept.push(row);
@@ -1024,6 +1090,7 @@ function filterBootGraph(graph) {
     if (typeof row !== "object" || row === null) return null;
     const batch = row;
     if (!Array.isArray(batch.entries) || batch.entries.some((id) => typeof id !== "string")) return null;
+    if (batch.url !== void 0 && typeof batch.url !== "string") return null;
   }
   if (removed.size === 0) return graph;
   for (const row of kept) {
@@ -1038,16 +1105,36 @@ function filterBootGraph(graph) {
     const batch = row;
     const remaining = batch.entries.filter((id) => typeof id === "string" && !removed.has(id));
     if (remaining.length === 0) continue;
-    batches.push(
-      remaining.length === batch.entries.length ? row : { ...row, entries: remaining }
-    );
+    const url = typeof batch.url === "string" ? filterBatchUrl(batch.url, removed) : void 0;
+    const entriesChanged = remaining.length !== batch.entries.length;
+    const urlChanged = url !== batch.url;
+    batches.push(entriesChanged || urlChanged ? {
+      ...row,
+      entries: remaining,
+      ...url === void 0 ? {} : { url }
+    } : row);
   }
   return { ...graph, entries: kept, batches };
 }
 function stripClient(spec) {
+  if (spec.endsWith("/client.js")) return spec.slice(0, -"/client.js".length);
   return spec.endsWith("/client") ? spec.slice(0, -"/client".length) : spec;
 }
-function applyUiGate(html) {
+function filterBatchUrl(url, removed) {
+  const marker = url.indexOf("??");
+  if (marker === -1) return url;
+  const modulesStart = marker + 2;
+  const suffixStart = url.indexOf("&", modulesStart);
+  const modulesEnd = suffixStart === -1 ? url.length : suffixStart;
+  const modules = url.slice(modulesStart, modulesEnd).split(",");
+  const remaining = modules.filter((spec) => {
+    const id = spec.endsWith("/client.js") ? spec.slice(0, -"/client.js".length) : stripClient(spec);
+    return !removed.has(id);
+  });
+  if (remaining.length === modules.length) return url;
+  return `${url.slice(0, modulesStart)}${remaining.join(",")}${url.slice(modulesEnd)}`;
+}
+function applyUiGate(html, user = { isAdmin: false }) {
   const start = html.indexOf(BOOT_MARKER);
   if (start === -1) return html;
   const jsonStart = start + BOOT_MARKER.length;
@@ -1060,7 +1147,7 @@ function applyUiGate(html) {
   } catch {
     return html;
   }
-  const filtered = filterBootGraph(graph);
+  const filtered = filterBootGraph(graph, user);
   if (filtered === null) return html;
   const rebuilt = JSON.stringify(filtered).replaceAll("<", "\\u003c");
   return `${html.slice(0, jsonStart)}${rebuilt}${html.slice(end)}`;
@@ -1133,7 +1220,7 @@ function createAuthorizeIndex(ctx) {
     return connection.authorizeIndex(req, res);
   };
 }
-function createGatewayHandler(ctx, config, store) {
+function createGatewayHandler(ctx, config, store, currentIdentity) {
   const distRoot = dirname5(config.distIndex);
   const renderIndex = indexRenderer(ctx, config.distIndex);
   const authorizeIndex = createAuthorizeIndex(ctx);
@@ -1152,7 +1239,18 @@ function createGatewayHandler(ctx, config, store) {
     }
     store.cleanup();
     const rawPath = new URL(req.url ?? "/", "http://x").pathname;
-    const render = config.uiRoleGate && !session.isAdmin ? async () => applyUiGate(await renderIndex()) : renderIndex;
+    const render = config.uiRoleGate && !session.isAdmin ? async () => {
+      let currentSession2 = session;
+      if (currentIdentity !== void 0) {
+        const identity = await currentIdentity(session.user);
+        store.updatePermissionsForUser(session.user, identity?.permissions ?? []);
+        currentSession2 = store.verify(token) ?? { ...session, permissions: [] };
+      }
+      return applyUiGate(await renderIndex(), {
+        isAdmin: currentSession2.isAdmin,
+        permissions: currentSession2.permissions
+      });
+    } : renderIndex;
     await serveStatic(
       decodeURIComponent(rawPath),
       res,
@@ -1328,7 +1426,7 @@ function createApiBridgeAuth(deps) {
       return;
     }
     deps.store.cleanup();
-    const user = { username: session.user, isAdmin: session.isAdmin };
+    const user = { username: session.user, isAdmin: session.isAdmin, permissions: session.permissions };
     if (request.method !== "POST") return next();
     if (user.isAdmin) {
       const adminEndpoint = endpointFromUrl(request.url);
@@ -1343,12 +1441,12 @@ function createApiBridgeAuth(deps) {
       return next();
     }
     if (deps.provisioner !== void 0) {
-      void deps.provisioner.ensure(user).catch(() => {
+      void deps.provisioner.ensure({ username: user.username, isAdmin: user.isAdmin }).catch(() => {
       });
     }
     const endpoint = endpointFromUrl(request.url);
     if (endpoint === void 0) return next();
-    if (!USER_ALLOWED.has(endpoint)) {
+    if (!canUseWireMethod(endpoint, user)) {
       if (!isKnownWireMethod(endpoint)) {
         try {
           deps.onUnknownMethod?.(endpoint, user.username);
@@ -1600,8 +1698,9 @@ function forbidden(namespace, method) {
 function wrapRemoteGateway(gateway, resolveUser, owns = () => false) {
   const allowed = (user, namespace, method) => {
     if (user.isAdmin) return true;
-    if (ADMIN_ONLY_NAMESPACES.has(namespace)) return false;
-    return USER_ALLOWED.has(`${namespace}.${method}`);
+    const endpoint = `${namespace}.${method}`;
+    if (ADMIN_ONLY_NAMESPACES.has(namespace) && permissionForWireMethod(endpoint) === void 0) return false;
+    return canUseWireMethod(endpoint, user);
   };
   const ownershipGuarded = (user, request) => {
     if (user.isAdmin) return true;
@@ -1638,7 +1737,12 @@ function createRemoteIsolation(options) {
     }
     const username = options.ownership.lookup(sid);
     if (username === void 0 || username === "") return void 0;
-    return { username, isAdmin: options.isAdmin?.(username) ?? false };
+    const permissions = options.permissions?.(username);
+    return {
+      username,
+      isAdmin: options.isAdmin?.(username) ?? false,
+      ...permissions === void 0 ? {} : { permissions }
+    };
   };
   const owns = (id) => {
     const user = resolveUser();
@@ -1668,7 +1772,8 @@ function peerUser(peer) {
   if (typeof user !== "object" || user === null) return void 0;
   const username = user.username;
   if (typeof username !== "string" || username === "") return void 0;
-  return { username, isAdmin: user.isAdmin === true };
+  const permissions = Array.isArray(user.permissions) ? user.permissions.filter((permission) => typeof permission === "string") : [];
+  return { username, isAdmin: user.isAdmin === true, permissions };
 }
 function installAdmitShadow(connection, deps, warn) {
   const target = connection;
@@ -1690,7 +1795,14 @@ function installAdmitShadow(connection, deps, warn) {
     if (token !== void 0) {
       const session = deps.store.verify(token);
       if (session !== void 0) {
-        return { ...admission, peer: wrapTagged(admission.peer, { username: session.user, isAdmin: session.isAdmin }, token, wrappers) };
+        return {
+          ...admission,
+          peer: wrapTagged(admission.peer, {
+            username: session.user,
+            isAdmin: session.isAdmin,
+            permissions: session.permissions
+          }, token, wrappers)
+        };
       }
     }
     return isBrowser ? { rejection: 401 } : admission;
@@ -1784,7 +1896,7 @@ function dispatchVerdict(endpoint, payload, peer, deps, warnedUnknown, warn) {
   if (parts.length !== 2) return "pass";
   const dotted = `${parts[0]}.${parts[1]}`;
   const classification = classifyWireMethod(dotted);
-  if (classification !== "user") {
+  if (!canUseWireMethod(dotted, user)) {
     if (classification === "unknown" && !warnedUnknown.has(dotted)) {
       warnedUnknown.add(dotted);
       warn(`dsh-login: stream guard denied unknown wire method '${dotted}' \u2014 upstream may have renamed it; refresh src/api-filter.ts`);
@@ -2077,911 +2189,281 @@ function createHostSessionSource(ctx) {
   };
 }
 
-// src/http-json.ts
-import { homedir } from "node:os";
-import { join as join3 } from "node:path";
-var MAX_JSON_BODY_BYTES = 8192;
-async function readBody(req, maxBytes = MAX_JSON_BODY_BYTES) {
-  const chunks = [];
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    if (Buffer.concat(chunks).length > maxBytes) {
-      throw new Error("body too large");
-    }
-  }
-  return Buffer.concat(chunks).toString("utf8");
-}
-function sendJson(res, status, body) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(body));
-}
-function resolveDshHome() {
-  const env = process.env.DSH_HOME;
-  return env !== void 0 && env.length > 0 ? env : join3(homedir(), ".dsh");
-}
-
-// src/login-api.ts
-async function parseCredentials(req) {
-  let body;
-  try {
-    body = await readBody(req);
-  } catch {
-    return null;
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return null;
-  }
-  if (typeof parsed.username !== "string" || typeof parsed.password !== "string") return null;
-  return { username: parsed.username, password: parsed.password };
-}
-function learnRequestHost(req, hosts) {
-  const host = req.headers.host;
-  if (typeof host === "string" && host.length > 0) hosts.learn(host);
-}
-function createLoginHandler(deps) {
-  return async (req, res) => {
-    const creds = await parseCredentials(req);
-    if (creds === null) {
-      sendJson(res, 400, { error: "bad request" });
-      return;
-    }
-    if (await deps.users.isEmpty()) {
-      sendJson(res, 500, { error: "no users configured" });
-      return;
-    }
-    const record = await deps.users.verify(creds.username, creds.password);
-    if (record === void 0) {
-      sendJson(res, 401, { error: "invalid credentials" });
-      return;
-    }
-    await deps.users.touchLastLogin(record.username).catch(() => {
-    });
-    const session = deps.store.create(record.username, record.isAdmin);
-    if (deps.autoTrust === true && deps.hosts !== void 0) learnRequestHost(req, deps.hosts);
-    res.setHeader("Set-Cookie", buildCookieHeader(session.token, deps.sessionTtl));
-    sendJson(res, 200, { ok: true });
-  };
-}
-function createLogoutHandler(store) {
-  return async (req, res) => {
-    const token = extractSessionToken(req.headers.cookie);
-    if (token !== void 0) store.revoke(token);
-    res.setHeader("Set-Cookie", buildClearCookieHeader());
-    res.writeHead(200);
-    res.end();
-  };
-}
-function createLogoutRedirectHandler(store) {
-  return async (req, res) => {
-    const token = extractSessionToken(req.headers.cookie);
-    if (token !== void 0) store.revoke(token);
-    res.setHeader("Set-Cookie", buildClearCookieHeader());
-    res.writeHead(302, { Location: "/login" });
-    res.end();
-  };
-}
-function createSetupHandler(deps) {
-  return async (req, res) => {
-    if (!await deps.users.isEmpty()) {
-      sendJson(res, 403, { error: "users already exist" });
-      return;
-    }
-    const creds = await parseCredentials(req);
-    if (creds === null || creds.password.length === 0) {
-      sendJson(res, 400, { error: "bad request" });
-      return;
-    }
-    let record;
-    try {
-      record = await deps.users.create(creds.username, creds.password, true);
-    } catch {
-      sendJson(res, 400, { error: "bad request" });
-      return;
-    }
-    await deps.users.touchLastLogin(record.username).catch(() => {
-    });
-    const session = deps.store.create(record.username, record.isAdmin);
-    if (deps.autoTrust === true && deps.hosts !== void 0) learnRequestHost(req, deps.hosts);
-    res.setHeader("Set-Cookie", buildCookieHeader(session.token, deps.sessionTtl));
-    sendJson(res, 200, { ok: true });
-  };
-}
-
-// src/admin-api.ts
-function requireSession(deps, req) {
-  const token = extractSessionToken(req.headers.cookie);
-  return token === void 0 ? void 0 : deps.store.verify(token);
-}
-async function readJsonObject(req) {
-  let body;
-  try {
-    body = await readBody(req);
-  } catch {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(body);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-function requireAdmin(deps, req, res) {
-  const session = requireSession(deps, req);
-  if (session === void 0) {
-    sendJson(res, 401, { error: "authentication required" });
-    return void 0;
-  }
-  if (!session.isAdmin) {
-    sendJson(res, 403, { error: "admin required" });
-    return void 0;
-  }
-  return session;
-}
-function createAdminRoutes(deps) {
-  const me = { kind: "exact", path: "/api/auth/me", handler: async (req, res) => {
-    const session = requireSession(deps, req);
-    if (session === void 0) return sendJson(res, 401, { error: "authentication required" });
-    return sendJson(res, 200, { username: session.user, isAdmin: session.isAdmin });
-  } };
-  const capabilitiesRoute = { kind: "exact", path: "/api/auth/capabilities", handler: async (req, res) => {
-    const session = requireSession(deps, req);
-    if (session === void 0) return sendJson(res, 401, { error: "authentication required" });
-    return sendJson(res, 200, {
-      username: session.user,
-      isAdmin: session.isAdmin,
-      capabilities: deriveCapabilities({ username: session.user, isAdmin: session.isAdmin })
-    });
-  } };
-  const usersRoute = { kind: "exact", path: "/api/auth/admin/users", handler: async (req, res) => {
-    if (req.method === "GET") {
-      if (requireAdmin(deps, req, res) === void 0) return;
-      const records = await deps.users.list();
-      const online = deps.store.onlineCounts();
-      return sendJson(res, 200, {
-        users: records.map((record) => ({
-          username: record.username,
-          isAdmin: record.isAdmin,
-          lastLoginAt: record.lastLoginAt ?? null,
-          disabled: record.disabled === true,
-          onlineSessions: online.get(record.username) ?? 0
-        }))
-      });
-    }
-    if (requireAdmin(deps, req, res) === void 0) return;
-    const body = await readJsonObject(req);
-    if (body === null) return sendJson(res, 400, { error: "bad request" });
-    const { username, password, isAdmin } = body;
-    if (typeof username !== "string" || typeof password !== "string" || password.length === 0) {
-      return sendJson(res, 400, { error: "bad request" });
-    }
-    if (isAdmin !== void 0 && typeof isAdmin !== "boolean") return sendJson(res, 400, { error: "bad request" });
-    if ((await deps.users.list()).some((u) => u.username === username)) {
-      return sendJson(res, 409, { error: "user exists" });
-    }
-    try {
-      await deps.users.create(username, password, isAdmin === true);
-    } catch {
-      return sendJson(res, 400, { error: "bad request" });
-    }
-    return sendJson(res, 201, { ok: true });
-  } };
-  const userPassword = { kind: "exact", path: "/api/auth/admin/users/password", handler: async (req, res) => {
-    if (requireAdmin(deps, req, res) === void 0) return;
-    const body = await readJsonObject(req);
-    if (body === null) return sendJson(res, 400, { error: "bad request" });
-    const { username, password } = body;
-    if (typeof username !== "string" || typeof password !== "string" || password.length === 0) {
-      return sendJson(res, 400, { error: "bad request" });
-    }
-    try {
-      await deps.users.setPassword(username, password);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "";
-      if (message.includes("unknown user")) return sendJson(res, 404, { error: "unknown user" });
-      return sendJson(res, 400, { error: "bad request" });
-    }
-    deps.store.revokeAllFor(username);
-    return sendJson(res, 200, { ok: true });
-  } };
-  const userRemove = { kind: "exact", path: "/api/auth/admin/users/remove", handler: async (req, res) => {
-    if (requireAdmin(deps, req, res) === void 0) return;
-    const body = await readJsonObject(req);
-    if (body === null || typeof body.username !== "string") return sendJson(res, 400, { error: "bad request" });
-    const target = body.username;
-    const records = await deps.users.list();
-    const record = records.find((u) => u.username === target);
-    if (record === void 0) return sendJson(res, 404, { error: "unknown user" });
-    if (record.isAdmin && records.filter((u) => u.isAdmin).length === 1) {
-      return sendJson(res, 409, { error: "cannot remove the last admin" });
-    }
-    await deps.users.remove(target);
-    deps.store.revokeAllFor(target);
-    return sendJson(res, 200, { ok: true });
-  } };
-  const hosts = deps.hosts;
-  const hostsRoute = hosts === void 0 ? void 0 : { kind: "exact", path: "/api/auth/admin/hosts", handler: async (req, res) => {
-    if (req.method === "GET") {
-      if (requireAdmin(deps, req, res) === void 0) return;
-      return sendJson(res, 200, { hosts: hosts.list() });
-    }
-    if (req.method !== "POST" && req.method !== "DELETE") {
-      if (requireAdmin(deps, req, res) === void 0) return;
-      return sendJson(res, 405, { error: "method not allowed" });
-    }
-    if (requireAdmin(deps, req, res) === void 0) return;
-    const body = await readJsonObject(req);
-    if (body === null || typeof body.host !== "string" || body.host.length === 0) {
-      return sendJson(res, 400, { error: "bad request" });
-    }
-    const raw = body.host;
-    if (raw.length > MAX_HOST_LENGTH || !isBareAuthority(raw)) {
-      return sendJson(res, 400, { error: "invalid host" });
-    }
-    const canonical = hosts.canonicalize(raw);
-    if (req.method === "POST") {
-      const added = hosts.add(raw);
-      return sendJson(res, added ? 201 : 200, { ok: true, host: canonical });
-    }
-    hosts.remove(canonical);
-    return sendJson(res, 200, { ok: true, host: canonical });
-  } };
-  const userDisable = { kind: "exact", path: "/api/auth/admin/users/disable", handler: async (req, res) => {
-    if (requireAdmin(deps, req, res) === void 0) return;
-    const body = await readJsonObject(req);
-    if (body === null || typeof body.username !== "string" || typeof body.disabled !== "boolean") {
-      return sendJson(res, 400, { error: "bad request" });
-    }
-    const target = body.username;
-    const records = await deps.users.list();
-    const record = records.find((u) => u.username === target);
-    if (record === void 0) return sendJson(res, 404, { error: "unknown user" });
-    if (body.disabled && record.isAdmin && records.filter((u) => u.isAdmin && u.disabled !== true).length === 1) {
-      return sendJson(res, 409, { error: "cannot disable the last enabled admin" });
-    }
-    await deps.users.setDisabled(target, body.disabled);
-    if (body.disabled) deps.store.revokeAllFor(target);
-    return sendJson(res, 200, { ok: true });
-  } };
-  const setting = deps.defaultWorkspaceSetting;
-  const settingRoute = setting === void 0 ? void 0 : { kind: "exact", path: "/api/auth/admin/settings/default-workspace", handler: async (req, res) => {
-    if (requireAdmin(deps, req, res) === void 0) return;
-    if (req.method === "GET") return sendJson(res, 200, { enabled: setting.get() });
-    if (req.method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
-    const body = await readJsonObject(req);
-    if (body === null || typeof body.enabled !== "boolean") return sendJson(res, 400, { error: "bad request" });
-    setting.set(body.enabled);
-    return sendJson(res, 200, { ok: true, enabled: setting.get() });
-  } };
-  const remoteSetting = deps.remoteWebUiSetting;
-  const remoteSettingRoute = remoteSetting === void 0 ? void 0 : { kind: "exact", path: "/api/auth/admin/settings/remote-web-ui-compat", handler: async (req, res) => {
-    if (requireAdmin(deps, req, res) === void 0) return;
-    if (req.method === "GET") return sendJson(res, 200, { enabled: remoteSetting.get() });
-    if (req.method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
-    const body = await readJsonObject(req);
-    if (body === null || typeof body.enabled !== "boolean") return sendJson(res, 400, { error: "bad request" });
-    remoteSetting.set(body.enabled);
-    let applied = "skipped";
-    if (deps.onRemoteWebUiApply !== void 0) applied = await deps.onRemoteWebUiApply(body.enabled);
-    return sendJson(res, 200, { ok: true, enabled: remoteSetting.get(), applied });
-  } };
-  const routes = [me, capabilitiesRoute, usersRoute, userPassword, userRemove, userDisable];
-  if (hostsRoute !== void 0) routes.push(hostsRoute);
-  if (settingRoute !== void 0) routes.push(settingRoute);
-  if (remoteSettingRoute !== void 0) routes.push(remoteSettingRoute);
-  return routes;
-}
-
 // src/login-page.ts
-var BOARD_JS = `
-    (function () {
-      var reduce = window.matchMedia
-        && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-      var board = document.getElementById('board');
-      var pane = document.getElementById('paneDark');
-      var CELL = 72, SIZE = 56;
-
-      function layout() {
-        board.innerHTML = '';
-        var W = pane.clientWidth, H = pane.clientHeight;
-        var cols = Math.ceil(W / CELL);
-        var rows = Math.ceil(H / CELL);
-        var count = Math.min(18, Math.max(8, Math.round(cols * rows * 0.04)));
-        var picks = {};
-        var placed = 0, guard = 0;
-        while (placed < count && guard++ < cols * rows * 4) {
-          var c = Math.floor(Math.random() * cols);
-          var r = Math.floor(Math.random() * rows);
-          var x = c * CELL + (CELL - SIZE) / 2;
-          var y = r * CELL + (CELL - SIZE) / 2;
-          // keep the space behind the text block clean
-          if (x < 520 && y > H * 0.18 && y < H * 0.82) continue;
-          var key = c + ':' + r;
-          if (picks[key]) continue;
-          picks[key] = true;
-          var t = document.createElement('div');
-          t.className = 'tile' + (Math.random() < 0.35 ? ' tile--lit' : '');
-          t.style.left = x + 'px';
-          t.style.top = y + 'px';
-          t.style.setProperty('--d', (placed * 45) + 'ms');
-          if (!reduce && Math.random() < 0.4) {
-            t.style.setProperty('--breath-delay', (6 + Math.random() * 16) + 's');
-          }
-          board.appendChild(t);
-          placed++;
-        }
-      }
-
-      var tm;
-      window.addEventListener('resize', function () {
-        clearTimeout(tm);
-        tm = setTimeout(layout, 200);
-      });
-      layout();
-    })();
-`;
-var BASE_CSS = `
-    :root {
-      --bg: #0f1420;
-      --panel: #151b2c;
-      --inset: #0d1220;
-      --line: #262f47;
-      --line-soft: #1c2438;
-      --text: #e8ebf4;
-      --muted: #97a0b6;
-      --accent: #6f9bff;
-      --accent-soft: rgba(111, 155, 255, 0.14);
-      --ok: #46d19a;
-      --lt-bg: #f3f5fa;
-      --lt-card: #ffffff;
-      --lt-line: #e1e6f1;
-      --lt-inset: #f6f8fc;
-      --lt-text: #1d2536;
-      --lt-muted: #67718c;
-      --danger: #d64545;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
-        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-      min-height: 100vh;
-    }
-
-    .split {
-      display: flex;
-      min-height: 100vh;
-    }
-    .pane { flex: 1 1 50%; position: relative; }
-
-    /* ---- left: the dark DSH side ---- */
-    .pane--dark {
-      flex-basis: 53%;
-      background: var(--bg);
-      overflow: hidden;
-    }
-    .board-bg {
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background-image:
-        linear-gradient(var(--line-soft) 1px, transparent 1px),
-        linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
-      background-size: 72px 72px;
-      opacity: 0.35;
-    }
-    .board-bg::after {
-      content: '';
-      position: absolute;
-      inset: 0;
-      background: radial-gradient(
-        ellipse 90% 80% at 30% 50%,
-        transparent 30%, var(--bg) 100%
-      );
-    }
-    #board { position: absolute; inset: 0; pointer-events: none; }
-    .tile {
-      position: absolute;
-      width: 56px;
-      height: 56px;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      background: rgba(21, 27, 44, 0.55);
-      opacity: 0;
-      animation: tileIn 0.6s ease both;
-      animation-delay: var(--d, 0ms);
-    }
-    .tile--lit {
-      border-color: rgba(111, 155, 255, 0.45);
-      background: var(--accent-soft);
-      animation: tileIn 0.6s ease both, breath 7s ease-in-out infinite;
-      animation-delay: var(--d, 0ms), var(--breath-delay, 4s);
-    }
-    .tile--lit::before {
-      content: '';
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      width: 6px;
-      height: 6px;
-      margin: -3px 0 0 -3px;
-      border-radius: 50%;
-      background: var(--accent);
-      opacity: 0.8;
-    }
-    @keyframes tileIn {
-      from { opacity: 0; transform: translateY(8px); }
-      to { opacity: 0.9; transform: none; }
-    }
-    @keyframes breath {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(111, 155, 255, 0); }
-      50% { box-shadow: 0 0 22px 0 rgba(111, 155, 255, 0.16); }
-    }
-
-    .pane-content {
-      position: relative;
-      height: 100%;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      padding: 48px 60px;
-      max-width: 560px;
-      animation: rise 0.55s cubic-bezier(0.22, 0.8, 0.36, 1) both;
-    }
-    @keyframes rise {
-      from { opacity: 0; transform: translateY(12px); }
-      to { opacity: 1; transform: none; }
-    }
-
-    .brand-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .brand-row svg { flex: none; }
-    .brand-row .wordmark {
-      font-size: 2.35rem;
-      font-weight: 750;
-      letter-spacing: 0.02em;
-      line-height: 1;
-    }
-    .kicker {
-      margin-top: 16px;
-      font-size: 0.82rem;
-      font-weight: 600;
-      color: var(--accent);
-      letter-spacing: 0.01em;
-    }
-    .lead {
-      margin-top: 10px;
-      font-size: 0.88rem;
-      color: var(--muted);
-      line-height: 1.75;
-      max-width: 26em;
-    }
-
-    .features {
-      list-style: none;
-      margin-top: 44px;
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-    }
-    .features li {
-      display: flex;
-      align-items: flex-start;
-      gap: 14px;
-    }
-    .features li i {
-      flex: none;
-      width: 9px;
-      height: 9px;
-      margin-top: 5px;
-      border-radius: 2.5px;
-      background: var(--accent-soft);
-      border: 1px solid rgba(111, 155, 255, 0.5);
-    }
-    .features li b {
-      display: block;
-      font-size: 0.92rem;
-      font-weight: 600;
-      color: var(--text);
-      margin-bottom: 3px;
-    }
-    .features li span {
-      display: block;
-      font-size: 0.78rem;
-      color: var(--muted);
-      line-height: 1.6;
-    }
-
-    .footnote {
-      position: absolute;
-      left: 60px;
-      bottom: 56px;
-      font-size: 0.7rem;
-      color: #6b7490;
-      line-height: 1.6;
-    }
-    .loaded {
-      position: absolute;
-      left: 60px;
-      bottom: 30px;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 0.7rem;
-      color: #6b7490;
-    }
-    .loaded i {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--ok);
-      box-shadow: 0 0 6px rgba(70, 209, 154, 0.55);
-    }
-
-    /* ---- right: the light form side ---- */
-    .pane--light {
-      background: var(--lt-bg);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 40px 32px;
-    }
-    /* soft blue glow seating the card */
-    .pane--light::after {
-      content: '';
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background: radial-gradient(
-        ellipse 55% 48% at 50% 46%,
-        rgba(111, 155, 255, 0.09), transparent 70%
-      );
-    }
-
-    /* ghost plugin tiles: the board's quiet echoes on this side */
-    .ghost {
-      position: absolute;
-      width: 46px;
-      height: 46px;
-      border: 1px solid #dfe5f0;
-      border-radius: 10px;
-      background: rgba(255, 255, 255, 0.7);
-      pointer-events: none;
-      animation: rise 0.7s cubic-bezier(0.22, 0.8, 0.36, 1) both;
-    }
-    .ghost--g1 { top: 11%; left: 13%; animation-delay: 320ms; }
-    .ghost--g2 { bottom: 13%; right: 11%; animation-delay: 420ms; }
-    .ghost--g3 {
-      top: 15%;
-      right: 15%;
-      border-color: rgba(111, 155, 255, 0.4);
-      background: #eef2fd;
-      animation-delay: 520ms;
-    }
-    .ghost--g3::before {
-      content: '';
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      width: 5px;
-      height: 5px;
-      margin: -2.5px 0 0 -2.5px;
-      border-radius: 50%;
-      background: var(--accent);
-      opacity: 0.7;
-    }
-
-    /* free plugin slots, top-right: one is taken */
-    .slots {
-      position: absolute;
-      top: 26px;
-      right: 30px;
-      display: flex;
-      gap: 7px;
-      pointer-events: none;
-      animation: rise 0.7s cubic-bezier(0.22, 0.8, 0.36, 1) both;
-      animation-delay: 600ms;
-    }
-    .slots span {
-      width: 9px;
-      height: 9px;
-      border: 1px solid #cdd6e6;
-      border-radius: 3px;
-    }
-    .slots span:first-child {
-      background: var(--accent);
-      border-color: var(--accent);
-      opacity: 0.75;
-    }
-
-    .card {
-      position: relative;
-      z-index: 1;
-      width: 372px;
-      max-width: 100%;
-      background: var(--lt-card);
-      border: 1px solid var(--lt-line);
-      border-radius: 16px;
-      padding: 34px 34px 30px;
-      box-shadow: 0 14px 36px rgba(23, 32, 55, 0.08);
-      animation: rise 0.55s cubic-bezier(0.22, 0.8, 0.36, 1) both;
-      animation-delay: 130ms;
-    }
-    .card h1 {
-      font-size: 1.3rem;
-      font-weight: 650;
-      color: var(--lt-text);
-      margin-bottom: 6px;
-    }
-    .card .subtitle {
-      font-size: 0.82rem;
-      color: var(--lt-muted);
-      line-height: 1.6;
-      margin-bottom: 20px;
-    }
-    .field { margin-bottom: 14px; }
-    .card input[type="text"], .card input[type="password"] {
-      width: 100%;
-      padding: 11px 14px;
-      background: var(--lt-inset);
-      border: 1px solid var(--lt-line);
-      border-radius: 9px;
-      color: var(--lt-text);
-      font-size: 0.95rem;
-      outline: none;
-      transition: border-color 0.15s;
-    }
-    .card input::placeholder { color: #9aa3b8; }
-    .card input[type="text"]:focus,
-    .card input[type="password"]:focus {
-      border-color: var(--accent);
-    }
-    .card input:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: 1px;
-    }
-    .card button[type="submit"] {
-      width: 100%;
-      padding: 11px;
-      margin-top: 4px;
-      background: var(--accent);
-      border: none;
-      border-radius: 9px;
-      color: #fff;
-      font-size: 0.95rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.15s;
-    }
-    .card button[type="submit"]:hover { background: #5d8dfe; }
-    .card button[type="submit"]:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: 2px;
-    }
-    .card button[type="submit"]:disabled {
-      background: #b6c4e4;
-      cursor: not-allowed;
-    }
-    .error {
-      color: var(--danger);
-      font-size: 0.82rem;
-      min-height: 1.3em;
-      margin-bottom: 10px;
-    }
-
-    @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        animation: none !important;
-        transition: none !important;
-      }
-      .tile { opacity: 0.9; }
-    }
-
-    /* ---- narrow screens: dark story stacks on top of the form ---- */
-    @media (max-width: 880px) {
-      .split { flex-direction: column; }
-      .pane--dark { flex-basis: auto; overflow: visible; }
-      .pane-content {
-        min-height: 0;
-        padding: 36px 28px 30px;
-      }
-      .features { margin-top: 28px; gap: 14px; }
-      .footnote { position: static; margin-top: 24px; }
-      .loaded { position: static; margin-top: 10px; }
-      .tile { display: none; }
-      .pane--light { padding: 36px 24px 44px; }
-      .ghost, .slots { display: none; }
-    }
-`;
-var PLUG_SVG = `
-      <svg width="26" height="26" viewBox="0 0 24 24" fill="none"
-        stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round"
-        stroke-linejoin="round" aria-hidden="true">
-        <path d="M9 7V3" /><path d="M15 7V3" />
-        <path d="M7 7h10v4a5 5 0 0 1-5 5 5 5 0 0 1-5-5V7z" />
-        <path d="M12 16v5" />
-      </svg>`;
-function renderPage(opts) {
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${opts.title}</title>
-  <style>${BASE_CSS}</style>
-</head>
-<body>
-  <main class="split">
-    <section class="pane pane--dark" id="paneDark">
-      <div class="board-bg" aria-hidden="true"></div>
-      <div id="board" aria-hidden="true"></div>
-      <div class="pane-content">
-        <header class="brand">
-          <div class="brand-row">${PLUG_SVG}<div class="wordmark">DSH</div></div>
-          <p class="kicker">\u591A\u7528\u6237\u767B\u5F55\u7F51\u5173\uFF0C\u800C\u8FD9\u9053\u95E8\u672C\u8EAB\u4E5F\u662F\u4E00\u4E2A\u63D2\u4EF6\u3002</p>
-          <p class="lead">DSH \u7684 Web GUI \u6309\u300C\u5355\u7528\u6237\u3001localhost\u300D\u8BBE\u8BA1\u2014\u2014\u4E00\u65E6\u66B4\u9732\u5230\u7F51\u7EDC\uFF0C\u4EFB\u4F55\u4EBA\u90FD\u80FD\u6253\u5F00\u5B83\u3002dsh-login \u52A0\u4E00\u9053\u767B\u5F55\u5899\uFF0C\u628A\u5B83\u53D8\u6210\u5B89\u5168\u7684\u591A\u7528\u6237\u90E8\u7F72\u3002</p>
-        </header>
-        <ul class="features">
-          <li><i></i><div><b>\u767B\u5F55\u5899</b><span>\u9875\u9762\u3001\u9759\u6001\u8D44\u6E90\u3001API \u4E0E WebSocket \u5168\u90E8\u8981\u6C42\u6709\u6548\u4F1A\u8BDD\uFF0C\u672A\u767B\u5F55\u4E00\u5F8B\u56DE\u5230\u8FD9\u9053\u95E8</span></div></li>
-          <li><i></i><div><b>\u4F1A\u8BDD\u9694\u79BB</b><span>\u666E\u901A\u7528\u6237\u53EA\u770B\u5230\u81EA\u5DF1\u7684\u5BF9\u8BDD\u3001\u5B50\u4EE3\u7406\u4E0E\u5DE5\u4F5C\u533A\uFF1B\u51ED\u636E\u3001\u5BBF\u4E3B\u8BBE\u7F6E\u7B49\u7BA1\u7406\u57DF\u6574\u4F53\u7981\u7528</span></div></li>
-          <li><i></i><div><b>\u7528\u6237\u7BA1\u7406</b><span>\u7BA1\u7406\u5458\u5728 \u8BBE\u7F6E \u2192 \u7528\u6237\u7BA1\u7406 \u65B0\u5EFA\u3001\u91CD\u7F6E\u5BC6\u7801\u3001\u7981\u7528\u3001\u5220\u9664\uFF0C\u64CD\u4F5C\u7ACB\u5373\u540A\u9500\u8BE5\u7528\u6237\u7684\u4F1A\u8BDD</span></div></li>
-          <li><i></i><div><b>\u8FDC\u7A0B\u53CB\u597D</b><span>frp\u3001\u96A7\u9053\u6216\u5C40\u57DF\u7F51\u8BBF\u95EE\uFF0C\u767B\u5F55\u4E00\u6B21\u5373\u81EA\u52A8\u4FE1\u4EFB\u4E3B\u673A\uFF0C\u65E0\u9700\u624B\u52A8\u6539\u914D\u7F6E</span></div></li>
-        </ul>
-      </div>
-      <div class="footnote">\u5BC6\u7801\u4EE5 scrypt \u54C8\u5E0C\u5B58\u50A8\uFF0C\u4F1A\u8BDD Cookie \u4E3A HttpOnly\uFF0C\u91CD\u542F\u540E\u767B\u5F55\u4F9D\u7136\u6709\u6548\u3002</div>
-      <div class="loaded"><i></i>dsh-login \u5DF2\u52A0\u8F7D</div>
-    </section>
-    <section class="pane pane--light">
-      <div class="ghost ghost--g1" aria-hidden="true"></div>
-      <div class="ghost ghost--g2" aria-hidden="true"></div>
-      <div class="ghost ghost--g3" aria-hidden="true"></div>
-      <div class="slots" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
-      <div class="card">
-        <h1>${opts.heading}</h1>
-        <div class="subtitle">${opts.subtitle}</div>
-        <div class="error" id="error" role="alert"></div>
-        <form id="authForm">${opts.fields}</form>
-      </div>
-    </section>
-  </main>
-  <script>${opts.script}</script>
-  <script>${BOARD_JS}</script>
-</body>
-</html>`;
-}
 function renderLoginPage() {
-  return renderPage({
-    title: "DSH \u767B\u5F55",
-    heading: "\u767B\u5F55 DSH",
-    subtitle: "\u591A\u7528\u6237\u7F51\u5173\uFF1A\u6BCF\u4EBA\u72EC\u7ACB\u4F1A\u8BDD\uFF0C\u6743\u9650\u5404\u5F52\u5176\u4F4D\u3002",
-    fields: `
-        <div class="field">
-          <input type="text" name="username" id="username" placeholder="\u7528\u6237\u540D"
-            autocomplete="username" autofocus required>
-        </div>
-        <div class="field">
-          <input type="password" name="password" id="password" placeholder="\u5BC6\u7801"
-            autocomplete="current-password" required>
-        </div>
-        <button type="submit" id="submit">\u767B\u5F55</button>`,
-    script: `
-    var form = document.getElementById('authForm');
-    var username = document.getElementById('username');
-    var password = document.getElementById('password');
-    var error = document.getElementById('error');
-    var submit = document.getElementById('submit');
-
-    form.addEventListener('submit', async function (e) {
-      e.preventDefault();
-      error.textContent = '';
-      submit.disabled = true;
-      submit.textContent = '\u9A8C\u8BC1\u4E2D\u2026';
-      try {
-        var res = await fetch('/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: username.value, password: password.value }),
-        });
-        if (res.ok) {
-          window.location = '/';
-        } else if (res.status === 401) {
-          error.textContent = '\u7528\u6237\u540D\u6216\u5BC6\u7801\u9519\u8BEF';
-          password.value = '';
-          password.focus();
-        } else if (res.status === 400) {
-          error.textContent = '\u8BF7\u6C42\u65E0\u6548';
-        } else if (res.status === 500) {
-          error.textContent = '\u5C1A\u672A\u521B\u5EFA\u4EFB\u4F55\u7528\u6237\uFF0C\u8BF7\u5237\u65B0\u9875\u9762\u5B8C\u6210\u521D\u59CB\u5316';
-        } else {
-          error.textContent = '\u672A\u77E5\u9519\u8BEF';
-        }
-      } catch (err) {
-        error.textContent = '\u7F51\u7EDC\u9519\u8BEF\uFF0C\u8BF7\u91CD\u8BD5';
-      } finally {
-        submit.disabled = false;
-        submit.textContent = '\u767B\u5F55';
-      }
-    });`
-  });
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>\u767B\u5F55 DSH</title><body style="font:16px system-ui;max-width:520px;margin:15vh auto;padding:24px;color:#172033"><h1>\u767B\u5F55 DSH</h1><p>\u4F7F\u7528 Admin \u8D26\u53F7\u7EE7\u7EED\u3002</p><p style="display:flex;flex-wrap:wrap;gap:12px"><a href="/api/auth/login" style="display:inline-block;padding:12px 20px;background:#2458d3;color:white;text-decoration:none;border-radius:6px">\u5FEB\u6377\u767B\u5F55</a><a href="/api/auth/login?mode=password" style="display:inline-block;padding:12px 20px;border:1px solid #2458d3;color:#2458d3;text-decoration:none;border-radius:6px">\u8D26\u53F7\u5BC6\u7801\u767B\u5F55</a></p><p style="font-size:14px;color:#667085">\u8D26\u53F7\u5BC6\u7801\u767B\u5F55\u4F1A\u6253\u5F00 Admin \u767B\u5F55\u9875\uFF0C\u767B\u5F55\u6210\u529F\u540E\u81EA\u52A8\u8FD4\u56DE DSH\u3002</p></body></html>`;
 }
-function renderSetupPage() {
-  return renderPage({
-    title: "DSH \u521D\u59CB\u5316",
-    heading: "\u521D\u59CB\u5316 DSH",
-    subtitle: "\u521B\u5EFA\u7B2C\u4E00\u4E2A\u8D26\u6237\uFF0C\u5B83\u5C06\u81EA\u52A8\u6210\u4E3A\u7BA1\u7406\u5458\u3002",
-    fields: `
-        <div class="field">
-          <input type="text" name="username" id="username" placeholder="\u7528\u6237\u540D"
-            autocomplete="username" autofocus required>
-        </div>
-        <div class="field">
-          <input type="password" name="password" id="password" placeholder="\u8BBE\u7F6E\u5BC6\u7801"
-            autocomplete="new-password" required>
-        </div>
-        <div class="field">
-          <input type="password" id="confirm" placeholder="\u786E\u8BA4\u5BC6\u7801"
-            autocomplete="new-password" required>
-        </div>
-        <button type="submit" id="submit">\u521B\u5EFA\u8D26\u6237</button>`,
-    script: `
-    var form = document.getElementById('authForm');
-    var username = document.getElementById('username');
-    var pw = document.getElementById('password');
-    var cf = document.getElementById('confirm');
-    var error = document.getElementById('error');
-    var submit = document.getElementById('submit');
 
-    form.addEventListener('submit', async function (e) {
-      e.preventDefault();
-      error.textContent = '';
-      if (username.value.length < 1) {
-        error.textContent = '\u7528\u6237\u540D\u4E0D\u80FD\u4E3A\u7A7A';
+// src/admin-sso.ts
+import { randomBytes as randomBytes2 } from "node:crypto";
+var SSO_NONCE_COOKIE_PREFIX = "dsh_sso_nonce_";
+function createAdminSso(config, sessions) {
+  const tokens = /* @__PURE__ */ new Map();
+  const refreshes = /* @__PURE__ */ new Map();
+  const pending = /* @__PURE__ */ new Map();
+  const loginListeners = /* @__PURE__ */ new Set();
+  const logoutListeners = /* @__PURE__ */ new Set();
+  const refreshAccessToken = async (userId) => (await refreshUserToken(userId)).accessToken;
+  const refreshUserToken = async (userId) => {
+    const existing = tokens.get(userId);
+    if (!existing || existing.refreshExpiresAt <= Date.now()) throw new Error("Admin login required");
+    const inFlight = refreshes.get(userId);
+    if (inFlight) return await inFlight;
+    const refresh = postJson(`${config.adminBaseUrl}/sso/refresh`, {
+      refresh_token: existing.refreshToken,
+      client_id: config.clientId
+    }).then((response) => {
+      const next = toTokenSet(response, normalizeIdentity(response.user ?? existing.identity));
+      tokens.set(userId, next);
+      sessions.updatePermissionsForUser(userId, next.identity.permissions);
+      return next;
+    }).catch(async (error) => {
+      tokens.delete(userId);
+      sessions.revokeAllFor(userId);
+      for (const listener of logoutListeners) await Promise.resolve(listener(userId)).catch(() => void 0);
+      throw error;
+    }).finally(() => refreshes.delete(userId));
+    refreshes.set(userId, refresh);
+    return await refresh;
+  };
+  const accessToken = async (userId) => {
+    const current = tokens.get(userId);
+    if (!current || current.refreshExpiresAt <= Date.now()) throw new Error("Admin login required");
+    if (current.expiresAt <= Date.now() + 3e4) return await refreshAccessToken(userId);
+    return current.accessToken;
+  };
+  const userInfo = async (userId) => {
+    try {
+      const identity = normalizeIdentity(await postOrGetJson(
+        `${config.adminBaseUrl}/sso/userinfo`,
+        await accessToken(userId)
+      ));
+      sessions.updatePermissionsForUser(userId, identity.permissions);
+      return identity;
+    } catch {
+      return void 0;
+    }
+  };
+  const logout = async (sessionToken) => {
+    if (!sessionToken) return;
+    const session = sessions.verify(sessionToken);
+    if (!session) return;
+    const tokenSet = tokens.get(session.user);
+    sessions.revokeAllFor(session.user);
+    for (const listener of logoutListeners) await Promise.resolve(listener(session.user)).catch(() => void 0);
+    if (tokenSet) {
+      tokens.delete(session.user);
+      await fetch(`${config.adminBaseUrl}/sso/logout`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${tokenSet.accessToken}` },
+        body: JSON.stringify({ refresh_token: tokenSet.refreshToken })
+      }).catch(() => void 0);
+    }
+  };
+  const loginRoute = {
+    kind: "exact",
+    path: "/api/auth/login",
+    handler: async (request, response) => {
+      const now = Date.now();
+      for (const [pendingState, grant] of pending) if (grant.expiresAt <= now) pending.delete(pendingState);
+      const state = randomBytes2(32).toString("base64url");
+      const browserNonce = randomBytes2(32).toString("base64url");
+      const nonceCookie = `${SSO_NONCE_COOKIE_PREFIX}${state}`;
+      pending.set(state, { state, browserNonce, expiresAt: Date.now() + 5 * 6e4 });
+      const url = new URL(`${config.adminBaseUrl}/sso/authorize`);
+      url.searchParams.set("client_id", config.clientId);
+      url.searchParams.set("redirect_uri", config.redirectUri);
+      url.searchParams.set("state", state);
+      const mode = new URL(request.url ?? "/", config.redirectUri).searchParams.get("mode");
+      const location = mode === "password" ? buildPasswordLoginUrl(config.adminBaseUrl, url) : url.toString();
+      const secure = config.redirectUri.startsWith("https://") ? "; Secure" : "";
+      response.writeHead(302, {
+        Location: location,
+        "Set-Cookie": `${nonceCookie}=${browserNonce}; Path=/; HttpOnly; SameSite=Lax; Max-Age=300${secure}`,
+        "Cache-Control": "no-store"
+      });
+      response.end();
+    }
+  };
+  const callbackRoute = {
+    kind: "exact",
+    path: new URL(config.redirectUri).pathname,
+    handler: async (request, response) => {
+      const url = new URL(request.url ?? "/", config.redirectUri);
+      const state = url.searchParams.get("state") ?? "";
+      const grant = pending.get(state);
+      pending.delete(state);
+      const nonceCookie = `${SSO_NONCE_COOKIE_PREFIX}${state}`;
+      if (!grant || grant.expiresAt <= Date.now() || readCookie(request.headers.cookie, nonceCookie) !== grant.browserNonce) {
+        sendHtml(response, 400, "\u767B\u5F55\u94FE\u63A5\u65E0\u6548\u6216\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u3002");
         return;
       }
-      if (pw.value.length < 1) {
-        error.textContent = '\u5BC6\u7801\u4E0D\u80FD\u4E3A\u7A7A';
+      const code = url.searchParams.get("code");
+      if (!code) {
+        sendHtml(response, 400, "Admin \u6388\u6743\u672A\u5B8C\u6210\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u3002");
         return;
       }
-      if (pw.value !== cf.value) {
-        error.textContent = '\u4E24\u6B21\u8F93\u5165\u7684\u5BC6\u7801\u4E0D\u4E00\u81F4';
-        cf.value = '';
-        cf.focus();
-        return;
-      }
-      submit.disabled = true;
-      submit.textContent = '\u521B\u5EFA\u4E2D\u2026';
       try {
-        var res = await fetch('/api/auth/setup', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: username.value, password: pw.value }),
+        const tokenSet = await postJson(`${config.adminBaseUrl}/sso/token`, {
+          code,
+          client_id: config.clientId,
+          redirect_uri: config.redirectUri
         });
-        if (res.ok) {
-          window.location = '/';
-        } else if (res.status === 403) {
-          error.textContent = '\u521D\u59CB\u5316\u5DF2\u5B8C\u6210\uFF0C\u8BF7\u76F4\u63A5\u767B\u5F55';
-        } else if (res.status === 400) {
-          error.textContent = '\u8BF7\u6C42\u65E0\u6548\uFF08\u7528\u6237\u540D\u9650\u5B57\u6BCD\u3001\u6570\u5B57\u3001\u4E0B\u5212\u7EBF\u548C\u8FDE\u5B57\u7B26\uFF0C\u6700\u957F 32 \u4F4D\uFF09';
-        } else {
-          error.textContent = '\u672A\u77E5\u9519\u8BEF';
+        if (!tokenSet.accessToken || !tokenSet.refreshToken) {
+          throw new Error("invalid Admin SSO response");
         }
-      } catch (err) {
-        error.textContent = '\u7F51\u7EDC\u9519\u8BEF\uFF0C\u8BF7\u91CD\u8BD5';
-      } finally {
-        submit.disabled = false;
-        submit.textContent = '\u521B\u5EFA\u8D26\u6237';
+        const identity = normalizeIdentity(await postOrGetJson(
+          `${config.adminBaseUrl}/sso/userinfo`,
+          tokenSet.accessToken
+        ));
+        if (identity?.userId === void 0 || !identity.username || tokenSet.user?.userId !== void 0 && String(tokenSet.user.userId) !== String(identity.userId)) {
+          throw new Error("invalid Admin SSO identity");
+        }
+        const userId = String(identity.userId);
+        tokens.set(userId, toTokenSet(tokenSet, identity));
+        const session = sessions.create(userId, false, identity.permissions);
+        if (config.autoTrustHosts && typeof request.headers.host === "string") config.hosts.learn(request.headers.host);
+        const secure = config.redirectUri.startsWith("https://") ? "; Secure" : "";
+        response.setHeader("Set-Cookie", [
+          `dsh_session=${session.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${config.sessionTtl}${secure}`,
+          `${nonceCookie}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`
+        ]);
+        for (const listener of loginListeners) void Promise.resolve(listener(userId)).catch(() => void 0);
+        response.writeHead(302, {
+          Location: `/?dsh_login=${Date.now().toString(36)}`,
+          "Cache-Control": "no-store"
+        });
+        response.end();
+      } catch {
+        sendHtml(response, 502, "\u65E0\u6CD5\u8FDE\u63A5 Admin \u5B8C\u6210\u767B\u5F55\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002");
       }
-    });`
+    }
+  };
+  const meRoute = { kind: "exact", path: "/api/auth/me", handler: async (request, response) => {
+    const session = currentSession(request.headers.cookie, sessions);
+    if (!session) return sendJson(response, 401, { error: "unauthorized" });
+    const identity = await userInfo(session.user);
+    if (!identity) return sendJson(response, 401, { error: "unauthorized" });
+    sendJson(response, 200, { ...identity, isAdmin: false });
+  } };
+  const capabilitiesRoute = { kind: "exact", path: "/api/auth/capabilities", handler: async (request, response) => {
+    const session = currentSession(request.headers.cookie, sessions);
+    if (!session) return sendJson(response, 401, { error: "unauthorized" });
+    const identity = await userInfo(session.user);
+    if (!identity) return sendJson(response, 401, { error: "unauthorized" });
+    sendJson(response, 200, {
+      capabilities: deriveCapabilities({
+        username: identity.username,
+        isAdmin: false,
+        permissions: identity.permissions
+      })
+    });
+  } };
+  const logoutRoute = { kind: "exact", path: "/api/auth/logout", handler: async (request, response) => {
+    if (request.headers.origin !== new URL(config.redirectUri).origin) {
+      response.writeHead(403, { "Cache-Control": "no-store" });
+      response.end();
+      return;
+    }
+    const token = extractSessionToken(request.headers.cookie);
+    if (token) await logout(token);
+    response.setHeader("Set-Cookie", buildClearCookieHeader());
+    response.writeHead(200, { "Cache-Control": "no-store" });
+    response.end();
+  } };
+  return {
+    routes: [loginRoute, callbackRoute, meRoute, capabilitiesRoute, logoutRoute],
+    accessToken,
+    refreshAccessToken,
+    isUserAuthenticated: (userId) => sessions.hasUser(userId),
+    userInfo,
+    logout,
+    async currentUser(cookie) {
+      const session = currentSession(cookie, sessions);
+      return session ? await userInfo(session.user) : void 0;
+    },
+    onLogin(listener) {
+      loginListeners.add(listener);
+      return () => loginListeners.delete(listener);
+    },
+    onLogout(listener) {
+      logoutListeners.add(listener);
+      return () => logoutListeners.delete(listener);
+    },
+    clear() {
+      pending.clear();
+      tokens.clear();
+      refreshes.clear();
+      loginListeners.clear();
+      logoutListeners.clear();
+    }
+  };
+}
+function buildPasswordLoginUrl(adminBaseUrl, authorizeUrl) {
+  const loginUrl = new URL(`${adminBaseUrl.replace(/\/+$/, "")}/login`);
+  loginUrl.searchParams.set("mode", "password");
+  loginUrl.searchParams.set("redirect", `${authorizeUrl.pathname}${authorizeUrl.search}`);
+  return loginUrl.toString();
+}
+function currentSession(cookie, sessions) {
+  const token = extractSessionToken(cookie);
+  return token ? sessions.verify(token) : void 0;
+}
+function normalizeIdentity(identity) {
+  return {
+    ...identity,
+    roles: Array.isArray(identity.roles) ? identity.roles : [],
+    permissions: Array.isArray(identity.permissions) ? [...new Set(identity.permissions.filter((permission) => typeof permission === "string"))] : []
+  };
+}
+function readCookie(cookieHeader, name2) {
+  if (typeof cookieHeader !== "string") return void 0;
+  for (const part of cookieHeader.split(";")) {
+    const item = part.trim();
+    if (item.startsWith(`${name2}=`)) return item.slice(name2.length + 1);
+  }
+  return void 0;
+}
+function toTokenSet(response, identity) {
+  return {
+    accessToken: response.accessToken,
+    refreshToken: response.refreshToken,
+    expiresAt: Date.now() + response.expiresIn * 1e3,
+    refreshExpiresAt: Date.now() + response.refreshExpiresIn * 1e3,
+    identity
+  };
+}
+async function postJson(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
   });
+  if (!response.ok) throw new Error(`Admin SSO request failed (${response.status})`);
+  return unwrapData(await response.json());
+}
+async function postOrGetJson(url, accessToken) {
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!response.ok) throw new Error(`Admin SSO request failed (${response.status})`);
+  return unwrapData(await response.json());
+}
+function unwrapData(value) {
+  if (typeof value !== "object" || value === null) return value;
+  const response = value;
+  return response.data !== void 0 && response.accessToken === void 0 ? response.data : value;
+}
+function sendHtml(response, status, message) {
+  response.writeHead(status, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    "Referrer-Policy": "no-referrer"
+  });
+  response.end(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Admin \u767B\u5F55</title><body style="font:16px system-ui;max-width:640px;margin:64px auto;padding:0 20px"><p>${message}</p><a href="/login">\u8FD4\u56DE\u767B\u5F55</a></body></html>`);
+}
+function sendJson(response, status, body) {
+  response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+  response.end(JSON.stringify(body));
 }
 
 // src/web-runtime.ts
@@ -3053,13 +2535,22 @@ function provideWebRuntime(ctx, trustedHosts) {
   return runtime;
 }
 
+// src/http-json.ts
+import { homedir } from "node:os";
+import { join as join3 } from "node:path";
+function resolveDshHome() {
+  const env = process.env.DSH_HOME;
+  return env !== void 0 && env.length > 0 ? env : join3(homedir(), ".dsh");
+}
+
 // src/glue.ts
 var DSH_LOGIN_OWNERSHIP_SERVICE = "dshLoginOwnership";
 function createDshLoginIsolation(deps) {
   return createRemoteIsolation({
     ownership: deps.ownership,
     currentSessionId: deps.currentSessionId ?? (() => void 0),
-    isAdmin: deps.isAdmin
+    isAdmin: deps.isAdmin,
+    permissions: deps.permissionsForUser
   });
 }
 function composeGuardedGateway(gateway, isolation) {
@@ -3079,20 +2570,31 @@ function composeDshLoginGuard(ctx, gateway) {
   const agents = ctx.agents;
   const isolation = createDshLoginIsolation({
     ownership,
-    currentSessionId: () => agents?.currentInitiator?.()?.id
+    currentSessionId: () => agents?.currentInitiator?.()?.id,
+    permissionsForUser: dshLoginPermissionLookup(ctx)
   });
   return composeGuardedGateway(gateway, isolation);
+}
+function dshLoginPermissionLookup(ctx) {
+  return (userId) => {
+    try {
+      const get = ctx.get;
+      const auth = get.call(ctx, "dshLoginAuth");
+      return auth?.permissionsForUser?.(userId) ?? [];
+    } catch {
+      return [];
+    }
+  };
 }
 
 // src/index.ts
 var name = "dsh-login";
-var inject = ["webServer", "credentials"];
+var inject = ["webServer"];
 function apply(ctx, config) {
   if (!config.enabled) return;
   const dataDir = config.dataDir === "" ? join4(resolveDshHome(), ".dsh-login") : config.dataDir;
-  const store = new SessionStore(config.sessionTtl, join4(dataDir, "sessions.json"));
-  const users = new UserStore(ctx.credentials, credentialRef(`${config.password}_USERS`));
-  const ownership = new OwnershipIndex(join4(dataDir, "ownership.json"));
+  const store = new SessionStore(config.sessionTtl);
+  const ownership = new OwnershipIndex(join4(dataDir, "ownership-v2.json"));
   const hosts = new TrustedHosts(join4(dataDir, "trusted-hosts.json"));
   const defaultWorkspaceSetting = new DefaultWorkspaceSetting(join4(dataDir, "settings.json"), config.defaultWorkspace);
   const remoteWebUiSetting = new BooleanSetting(join4(dataDir, "settings-remote-web-ui.json"), config.remoteWebUiCompat);
@@ -3101,7 +2603,15 @@ function apply(ctx, config) {
   });
   const distIndex = config.distIndex === "" ? resolveDistIndex() : config.distIndex;
   const gatewayConfig = { ...config, distIndex };
-  const loginDeps = { users, store, sessionTtl: config.sessionTtl, hosts, autoTrust: config.autoTrustHosts };
+  const publicBaseUrl = config.publicBaseUrl || ctx.webServer.getOrigin();
+  const adminSso = createAdminSso({
+    adminBaseUrl: config.adminBaseUrl.replace(/\/+$/, ""),
+    clientId: config.adminClientId,
+    redirectUri: `${publicBaseUrl.replace(/\/+$/, "")}/api/auth/callback`,
+    sessionTtl: config.sessionTtl,
+    autoTrustHosts: config.autoTrustHosts,
+    hosts
+  }, store);
   const runtime = config.takeOverWebRuntime ? provideWebRuntime(ctx, config.trustedHosts) : void 0;
   const workspaceRoot = config.workspaceRoot === "" ? join4(resolveDshHome(), "workspaces") : config.workspaceRoot;
   const provisioner = new DefaultWorkspaceProvisioner({
@@ -3116,36 +2626,27 @@ function apply(ctx, config) {
     kind: "exact",
     path: "/login",
     handler: async (_req, res) => {
-      const html = await users.isEmpty() ? renderSetupPage() : renderLoginPage();
+      const html = renderLoginPage();
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(html);
     }
   };
-  const gatewayHandler = createGatewayHandler(ctx, gatewayConfig, store);
+  const gatewayHandler = createGatewayHandler(ctx, gatewayConfig, store, adminSso.userInfo);
   ctx.effect(() => ctx.webServer.register(loginPageRoute), "dsh-login: /login");
-  ctx.effect(() => ctx.webServer.register({
-    kind: "exact",
-    path: "/api/auth/setup",
-    handler: createSetupHandler(loginDeps)
-  }), "dsh-login: /api/auth/setup");
-  ctx.effect(() => ctx.webServer.register({
-    kind: "exact",
-    path: "/api/auth/login",
-    handler: createLoginHandler(loginDeps)
-  }), "dsh-login: /api/auth/login");
-  ctx.effect(() => ctx.webServer.register({
-    kind: "exact",
-    path: "/api/auth/logout",
-    handler: createLogoutHandler(store)
-  }), "dsh-login: /api/auth/logout");
-  ctx.effect(() => ctx.webServer.register({
-    kind: "exact",
-    path: "/logout",
-    handler: createLogoutRedirectHandler(store)
-  }), "dsh-login: /logout");
-  for (const route of createAdminRoutes({ users, store, hosts, defaultWorkspaceSetting, remoteWebUiSetting, remoteWebUiCompat, onRemoteWebUiApply: (enabled) => applyWithRetry(remoteWebUiCompat, enabled, config.remoteWebUiPublicBaseUrl, 3, 50) })) {
+  for (const route of adminSso.routes) {
     ctx.effect(() => ctx.webServer.register(route), `dsh-login: ${route.path}`);
   }
+  ctx.provide("dshLoginAuth", {
+    accessToken: adminSso.accessToken,
+    refreshAccessToken: adminSso.refreshAccessToken,
+    isUserAuthenticated: adminSso.isUserAuthenticated,
+    userInfo: adminSso.userInfo,
+    permissionsForUser: (userId) => store.permissionsForUser(userId),
+    resolveAgentUserId: (agentSessionId) => ownership.lookup(agentSessionId),
+    currentUser: adminSso.currentUser,
+    onLogin: adminSso.onLogin,
+    onLogout: adminSso.onLogout
+  });
   const bootCompat = applyWithRetry(remoteWebUiCompat, remoteWebUiSetting.get(), config.remoteWebUiPublicBaseUrl);
   void bootCompat;
   ctx.effect(() => ctx.webServer.registerFallback(gatewayHandler), "dsh-login: gateway fallback");
@@ -3194,12 +2695,15 @@ function apply(ctx, config) {
       }, "dsh-login: dispatch-seam guard");
     });
   }
-  const cap = deriveCapabilities({ username: "", isAdmin: false });
+  const cap = deriveCapabilities({ username: "", isAdmin: false, permissions: [] });
   const sessionBaselineScript = `window.__DSH_SESSION__={username:null,isAdmin:false,capabilities:${JSON.stringify(cap)}};`;
   ctx.effect(() => ctx.on("webserver/index-inject", (table) => {
     table.push({ kind: "script", placement: "head", text: sessionBaselineScript });
   }), "dsh-login: capability baseline injection");
-  ctx.effect(() => () => Promise.all([store.flush(), ownership.flush(), hosts.flush(), defaultWorkspaceSetting.flush(), remoteWebUiSetting.flush()]), "dsh-login: sessions + ownership + hosts + settings flush");
+  ctx.effect(() => () => {
+    adminSso.clear();
+    return Promise.all([store.flush(), ownership.flush(), hosts.flush(), defaultWorkspaceSetting.flush(), remoteWebUiSetting.flush()]);
+  }, "dsh-login: sessions + ownership + hosts + settings flush");
 }
 export {
   Config,

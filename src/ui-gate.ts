@@ -44,6 +44,12 @@
  */
 
 import { ADMIN_ONLY_UI_PLUGINS } from './capabilities.ts'
+import {
+  CORE_UI_PLUGINS,
+  hasDshPermission,
+  permissionForUiPlugin,
+  type DshAccessUser,
+} from './dsh-permissions.ts'
 
 /**
  * The exact marker the webserver renders for the boot-graph global row
@@ -69,6 +75,7 @@ interface EntryShape {
 
 interface BatchShape {
   entries: unknown
+  url?: unknown
 }
 
 /**
@@ -76,7 +83,16 @@ interface BatchShape {
  * allow-list: everything not listed stays mounted, so user-facing community
  * plugins keep working and only the known admin-only surfaces are gated.
  */
-const DENIED_IDS: ReadonlySet<string> = new Set(ADMIN_ONLY_UI_PLUGINS)
+function deniedUiPlugins(user: DshAccessUser, pluginIds: readonly string[]): ReadonlySet<string> {
+  if (user.isAdmin) return new Set()
+  return new Set(pluginIds.filter(id => {
+    if (CORE_UI_PLUGINS.includes(id)) return false
+    const required = permissionForUiPlugin(id)
+    return required !== undefined
+      ? !hasDshPermission(user, required)
+      : ADMIN_ONLY_UI_PLUGINS.includes(id)
+  }))
+}
 
 /**
  * Filter a decoded WebBootGraph down to the entries an ordinary user may
@@ -88,7 +104,10 @@ const DENIED_IDS: ReadonlySet<string> = new Set(ADMIN_ONLY_UI_PLUGINS)
  *   or `null` when the value is not a graph this module understands — the
  *   caller then serves the original HTML unchanged.
  */
-export function filterBootGraph(graph: unknown): Record<string, unknown> | null {
+export function filterBootGraph(
+  graph: unknown,
+  user: DshAccessUser = { isAdmin: false },
+): Record<string, unknown> | null {
   if (typeof graph !== 'object' || graph === null) return null
   const shape = graph as GraphShape
   if (typeof shape.rev !== 'string' || !Array.isArray(shape.entries) || !Array.isArray(shape.batches)) {
@@ -98,12 +117,20 @@ export function filterBootGraph(graph: unknown): Record<string, unknown> | null 
   // verification — serve the original graph rather than guess.
   const kept: Record<string, unknown>[] = []
   const removed = new Set<string>()
+  const pluginIds = shape.entries.flatMap(row => {
+    if (typeof row !== 'object' || row === null) return []
+    const id = (row as EntryShape).id
+    return typeof id === 'string' ? [stripClient(id)] : []
+  })
+  const denied = deniedUiPlugins(user, [...ADMIN_ONLY_UI_PLUGINS, ...pluginIds])
   for (const row of shape.entries) {
     if (typeof row !== 'object' || row === null) return null
     const entry = row as EntryShape
     if (typeof entry.id !== 'string') return null
-    if (DENIED_IDS.has(entry.id)) {
+    const pluginId = stripClient(entry.id)
+    if (denied.has(pluginId)) {
       removed.add(entry.id)
+      removed.add(pluginId)
       continue
     }
     kept.push(row as Record<string, unknown>)
@@ -116,6 +143,7 @@ export function filterBootGraph(graph: unknown): Record<string, unknown> | null 
     if (typeof row !== 'object' || row === null) return null
     const batch = row as BatchShape
     if (!Array.isArray(batch.entries) || batch.entries.some(id => typeof id !== 'string')) return null
+    if (batch.url !== undefined && typeof batch.url !== 'string') return null
   }
   if (removed.size === 0) return graph as Record<string, unknown>
   // A kept bundle must not depend on a gated one: core packages never inject
@@ -136,11 +164,16 @@ export function filterBootGraph(graph: unknown): Record<string, unknown> | null 
     // preload row is left in place — an orphan combo script only registers
     // factories nothing materializes.
     if (remaining.length === 0) continue
-    batches.push(
-      remaining.length === batch.entries.length
-        ? row as Record<string, unknown>
-        : { ...(row as Record<string, unknown>), entries: remaining },
-    )
+    const url = typeof batch.url === 'string' ? filterBatchUrl(batch.url, removed) : undefined
+    const entriesChanged = remaining.length !== batch.entries.length
+    const urlChanged = url !== batch.url
+    batches.push(entriesChanged || urlChanged
+      ? {
+          ...(row as Record<string, unknown>),
+          entries: remaining,
+          ...(url === undefined ? {} : { url }),
+        }
+      : row as Record<string, unknown>)
   }
   // Spread preserves `rev` and any future top-level fields; entries/batches
   // replace the filtered arrays. Field order matches upstream (rev, entries,
@@ -150,7 +183,26 @@ export function filterBootGraph(graph: unknown): Record<string, unknown> | null 
 
 /** `<pkg>/client` aliases the bare package in `external` specifiers. */
 function stripClient(spec: string): string {
+  if (spec.endsWith('/client.js')) return spec.slice(0, -'/client.js'.length)
   return spec.endsWith('/client') ? spec.slice(0, -'/client'.length) : spec
+}
+
+/** Remove gated client modules from a combo URL while preserving its revision. */
+function filterBatchUrl(url: string, removed: ReadonlySet<string>): string {
+  const marker = url.indexOf('??')
+  if (marker === -1) return url
+  const modulesStart = marker + 2
+  const suffixStart = url.indexOf('&', modulesStart)
+  const modulesEnd = suffixStart === -1 ? url.length : suffixStart
+  const modules = url.slice(modulesStart, modulesEnd).split(',')
+  const remaining = modules.filter(spec => {
+    const id = spec.endsWith('/client.js')
+      ? spec.slice(0, -'/client.js'.length)
+      : stripClient(spec)
+    return !removed.has(id)
+  })
+  if (remaining.length === modules.length) return url
+  return `${url.slice(0, modulesStart)}${remaining.join(',')}${url.slice(modulesEnd)}`
 }
 
 /**
@@ -164,7 +216,7 @@ function stripClient(spec: string): string {
  * @param html - the fully rendered index HTML (webserver.renderIndex output).
  * @returns the HTML with the boot graph filtered, or the input HTML.
  */
-export function applyUiGate(html: string): string {
+export function applyUiGate(html: string, user: DshAccessUser = { isAdmin: false }): string {
   const start = html.indexOf(BOOT_MARKER)
   if (start === -1) return html
   const jsonStart = start + BOOT_MARKER.length
@@ -179,7 +231,7 @@ export function applyUiGate(html: string): string {
   } catch {
     return html
   }
-  const filtered = filterBootGraph(graph)
+  const filtered = filterBootGraph(graph, user)
   if (filtered === null) return html
   // Re-escape `<` exactly like the upstream renderer so the rebuilt element
   // is byte-compatible with what the webserver would have produced.

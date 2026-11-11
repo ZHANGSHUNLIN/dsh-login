@@ -1,8 +1,8 @@
 # Role-based whole-UI gating — evaluation (2026-11-10, re-verified 2026-11-11)
 
-**Status: evaluated, not implemented.** Upstream DSH still exposes no per-role UI
-control (no native accounts, no identity UI, no role model), and dsh-login's
-gate is binary: **admin** vs **ordinary user**.
+**Status: implemented in the current source tree; release and deployment pending.**
+Great Admin remains the role and permission source. DSH consumes `dsh:*`
+permission codes from SSO and applies a shared method and UI bundle policy.
 
 ## 1. What ships today (verified at dsh-login 0.3.12 / DSH 0.2.2-rc.1)
 
@@ -11,7 +11,7 @@ gate is binary: **admin** vs **ordinary user**.
 | Page / whole UI | `src/ui-gate.ts` (`applyUiGate` → `filterBootGraph`) | `ADMIN_ONLY_UI_PLUGINS` deny-list applied to `window.__DSH_BOOT__` entries + batches |
 | Wire / `/api` | `src/api-filter.ts` (`classifyWireMethod`) | `USER_ALLOWED` (124 of 204) / `ADMIN_ONLY_METHODS` (79) / host-internal |
 | Two-segment domains | `src/capabilities.ts` (`ADMIN_ONLY_TWO_SEGMENT_DOMAINS`) | admin-only deny-list |
-| Identity | `src/users.ts` (`isAdmin: boolean`), `src/session.ts` | boolean, no role field |
+| Identity | Admin SSO `permissions`, `src/session.ts` | stable Admin user ID plus DSH permission codes |
 | Discovery | `src/capabilities.ts` (`deriveCapabilities`) | per-identity methods/domains/uiPlugins, echoed by `GET /api/auth/capabilities` |
 
 Enforcement seams: the `/api` bridge wall (`apiBridgeAuth`), the dispatch-seam
@@ -24,34 +24,22 @@ empty batches disappear, and every unexpected shape fails open (serving the
 original HTML). Nothing about it is hard-wired to two roles — only the
 `DENIED_IDS` set is a constant.
 
-## 2. What "整个 UI 按角色权限控制" would require
+## 2. Permission policy
 
-1. **Role storage** — `users.ts` record gains `role: string` (the JSON store is
-   `${password}_USERS`); `isAdmin` becomes `role === 'admin'`, kept as a derived
-   accessor so every existing seam keeps working during migration; the first
-   user is forced admin exactly as today.
-2. **Role → UI plugin policy** — `DENIED_IDS` becomes a per-role resolver
-   (`uiPolicyFor(role)`), and `applyUiGate(html, role)` selects it. The filter
-   itself needs no change (per-entry, per-batch, fail-open).
-3. **Role → wire policy** — `classifyWireMethod` already returns one of three
-   buckets; a role policy adds a bucket per role (`USER_ALLOWED` subsets) and
-   `deriveCapabilities(role)` derives the advertised surface from the same
-   policy, so UI and API cannot disagree.
-4. **Admin surface** — the settings panel needs a role editor (assign a role per
-   user) and `GET /api/auth/capabilities` should echo `role` next to `isAdmin`.
-5. **Single policy source** — the three seams must consume one module
-   (`rolePolicy.ts`), otherwise a role added at the page gate but not at the
-   dispatch seam produces "UI hidden, API open" drift (the exact failure class
-   issue #11 fixed in the other direction).
+1. Admin registers `dsh:settings:manage`, `dsh:plugin:manage`, and
+   `dsh:agent-preset:manage` under `platform.dsh`; roles assign these through
+   the existing permission catalog.
+2. SSO exposes only `dsh:*` permission codes and reloads them on token refresh.
+3. DSH applies the shared `dsh-permissions.ts` mapping at the UI boot graph,
+   HTTP bridge, dispatch seam, and optional Remote guard.
+4. Unmapped admin methods remain denied. The settings permission explicitly
+   covers all `settings.*` because model settings share the DSH settings API.
 
 ## 3. Feasibility verdict
 
-**Feasible without any upstream change.** The three hard parts already exist:
-a per-request boot-graph rewrite, a bucketed wire classifier, and a JSON user
-store. Adding a role field and a policy resolver is additive work in
-`users.ts` + `ui-gate.ts` + `capabilities.ts` + `api-filter.ts` + the settings
-panel bundle, plus tests. Rough effort: **1–2 days**, dominated by tests and the
-settings-panel UI rather than by the gate itself.
+**Feasible without any upstream change.** The boot-graph rewrite and dispatch
+hooks support per-user policy. Admin's existing role editor already consumes
+the permission catalog, so no separate DSH role editor is needed.
 
 **Bounds that do not go away:**
 
@@ -65,15 +53,15 @@ settings-panel UI rather than by the gate itself.
   **non-owner** peers only; every dsh-login user arrives as an owner principal,
   so its role engine never applies to them.
 
-## 4. Recommendation
+## 4. Limits
 
-Do not implement on speculation: the two-role split already covers the
-login-gateway use case, and the `feat/harden-workspace-mutations` branch is
-explicitly paused waiting for upstream per-role UI control. Revisit when either
-(a) upstream ships a role/principal model that gives dsh-login users a
-non-owner identity, or (b) a deployment needs more than admin/ordinary (e.g.
-per-team plugin visibility). At that point the change is the five items in §2,
-with `rolePolicy.ts` as the one source of truth for all three seams.
+- UI bundle visibility cannot hide individual panels inside a shared bundle. Agent preset bundle IDs are classified from the DSH runtime graph because upstream package names can vary.
+- `dsh:settings:manage` is deliberately broad because the model settings UI
+  uses the general `settings.*` API.
+- Permission changes are applied when DSH receives an updated SSO identity;
+  users may need to reload or reauthenticate after role assignment changes.
+- Plugin installation can execute third-party code on the host and should be
+  assigned only to trusted roles.
 
 ## 5. Re-verification log
 
@@ -91,7 +79,6 @@ with `rolePolicy.ts` as the one source of truth for all three seams.
 One new observation: upstream now renders index pages **per Peer**
 (`snapshotFor(peer.principal)`, so a liveshare viewer page opens with that
 viewer's grants). That makes the page-render seam peer-aware, which is the shape
-a future role model would ride — but dsh-login identities are owner principals,
-so it carries no role for them today. Verdict and effort estimate in §3/§4
-stand; do not implement until (a) or (b) in §4 fires.
+a future role model would ride — while dsh-login continues to enforce Admin-
+provided roles for owner identities at its own UI, HTTP, and dispatch seams.
 

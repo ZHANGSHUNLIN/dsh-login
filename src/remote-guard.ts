@@ -14,7 +14,7 @@
  * user (each dsh-login user acts inside their own agent subtree → ownership
  * sidecar). A test supplies deterministic callbacks.
  */
-import { USER_ALLOWED } from './api-filter.ts'
+import { canUseWireMethod, permissionForWireMethod } from './dsh-permissions.ts'
 
 /** The live Remote-invocation request shape (structurally, from typertGateway). */
 export interface RemoteInvokeRequest {
@@ -44,6 +44,7 @@ export type WrappedRemoteGateway<G extends RemoteGateway = RemoteGateway> = Remo
 export interface GuardUser {
   username: string
   isAdmin: boolean
+  permissions?: readonly string[]
 }
 
 /** Resolve the user of the invoking agent/session. Return undefined to deny. */
@@ -156,10 +157,9 @@ export function wrapRemoteGateway<G extends RemoteGateway>(
 ): WrappedRemoteGateway<G> {
   const allowed = (user: GuardUser, namespace: string, method: string): boolean => {
     if (user.isAdmin) return true
-    if (ADMIN_ONLY_NAMESPACES.has(namespace)) return false
-    // Ordinary-user surface expressed per Remote endpoint (mirrors the old
-    // RpcMethodMap allow-list, now `namespace.method`).
-    return USER_ALLOWED.has(`${namespace}.${method}`)
+    const endpoint = `${namespace}.${method}`
+    if (ADMIN_ONLY_NAMESPACES.has(namespace) && permissionForWireMethod(endpoint) === undefined) return false
+    return canUseWireMethod(endpoint, user)
   }
 
   const ownershipGuarded = (user: GuardUser, request: RemoteInvokeRequest): boolean => {
@@ -211,6 +211,8 @@ export function createRemoteIsolation(options: {
   ownership: { lookup(sessionId: string): string | undefined }
   /** Admin check for a username (e.g. from the UserStore); defaults to false. */
   isAdmin?: (username: string) => boolean
+  /** Effective Admin permissions for the user; omitted permissions fail closed. */
+  permissions?: (username: string) => readonly string[]
   /**
    * Identify an admin session without requiring an ownership record: return the
    * admin's username for a session that belongs to an admin, or undefined
@@ -231,7 +233,12 @@ export function createRemoteIsolation(options: {
     }
     const username = options.ownership.lookup(sid)
     if (username === undefined || username === '') return undefined
-    return { username, isAdmin: options.isAdmin?.(username) ?? false }
+    const permissions = options.permissions?.(username)
+    return {
+      username,
+      isAdmin: options.isAdmin?.(username) ?? false,
+      ...(permissions === undefined ? {} : { permissions }),
+    }
   }
   // Ownership is scoped to the resolved user: an id is owned only when the
   // sidecar attributes it to the same username driving this call. Reading

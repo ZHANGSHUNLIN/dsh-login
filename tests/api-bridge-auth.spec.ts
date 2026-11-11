@@ -9,6 +9,7 @@ import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import HttpServer from '@deepseek-ai/dsh-host-webserver'
 import { MemoryCredentials } from './memory-credentials.ts'
+import { completeAdminSsoLogin } from './sso-helper.ts'
 import { SessionStore } from '../src/session.ts'
 import { OwnershipIndex } from '../src/ownership.ts'
 import { createApiBridgeAuth, type ApiBridgeAuthDeps } from '../src/api-bridge-auth.ts'
@@ -169,6 +170,25 @@ describe('createApiBridgeAuth (unit)', () => {
     expect(envelope.rpcId).toBe('rpc-1')
     expect(envelope.result?.ok).toBe(false)
     expect(envelope.result?.error?.code).toBe('forbidden')
+  })
+
+  it('admits a management method when its Admin permission is present', async () => {
+    const store = new SessionStore(3600)
+    const { token } = store.create('alice', false, ['dsh:settings:manage'])
+    const wall = createApiBridgeAuth(unitDeps(store))
+    const res = fakeResponse()
+    let innerRan = false
+    await wall(
+      fakeRequest(`dsh_session=${token}`, {
+        method: 'POST',
+        url: '/api/settings.update',
+        body: JSON.stringify({ type: 'client-request', rpcId: 'rpc-settings', method: 'settings.update', payload: {} }),
+      }) as never,
+      res as never,
+      async () => { innerRan = true },
+    )
+    expect(innerRan).toBe(true)
+    expect(res.status).toBeUndefined()
   })
 
   it('answers a plain 403 for denied methods when quietDenials is off', async () => {
@@ -430,7 +450,9 @@ async function loadComposition(apiBridgeAuth: boolean): Promise<{ port: number }
     "- id: login",
     "  name: '@islibaodong/dsh-login'",
     '  config:',
-    '    password: DSH_LOGIN_PASSWORD',
+    "    adminBaseUrl: 'http://admin.test/admin'",
+    "    adminClientId: 'dsh'",
+    "    publicBaseUrl: ''",
     `    distIndex: '${distIndex}'`,
     `    dataDir: '${dataDir}'`,
     '    sessionTtl: 3600',
@@ -460,11 +482,9 @@ async function loadComposition(apiBridgeAuth: boolean): Promise<{ port: number }
 }
 
 async function setupAdmin(port: number): Promise<string> {
-  const res = await fetch(`http://127.0.0.1:${String(port)}/api/auth/setup`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'root', password: 's3cret' }),
-  })
-  if (res.status !== 200) throw new Error(`setup failed: ${String(res.status)}`)
-  return res.headers.get('set-cookie')!.split(';')[0]!
+  const login = await completeAdminSsoLogin(port)
+  login.restoreFetch()
+  return login.cookie
 }
 
 /**
@@ -499,7 +519,11 @@ describe('dsh-login /api bridge auth wall (full composition)', () => {
 
     // Logout: the same cookie that was admitted is now vetoed.
     await fetch(`http://127.0.0.1:${String(port)}/api/auth/logout`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: '{}',
+      method: 'POST', headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie,
+        Origin: `http://127.0.0.1:${String(port)}`,
+      }, body: '{}',
     })
     let innerRanAfterLogout = false
     const afterLogout = emitBridgeRequest(cookie, async () => { innerRanAfterLogout = true })

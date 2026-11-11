@@ -31,11 +31,10 @@
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-locale"
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
       ],
-      "platform": "web",
-      "immediately": true
+      "platform": "web"
     }
   },
   "peerDependencies": {
@@ -71,7 +70,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/islibaodong/dsh-login.git"
+    "url": "git+https://github.com/ZHANGSHUNLIN/dsh-login.git"
   },
   "files": [
     "src",

@@ -211,6 +211,43 @@ describe('gateway handler', () => {
     }
     expect(principals).toEqual([{ kind: 'owner' }, { kind: 'owner' }])
   })
+
+  it('refreshes Admin permissions before filtering the first page render', { timeout: 60_000 }, async () => {
+    const { ctx, port } = await bootServer()
+    const dist = join(root!, 'dist')
+    await mkdir(dist, { recursive: true })
+    const distIndex = join(dist, 'index.html')
+    await writeFile(distIndex, '<html><head></head><body>shell</body></html>')
+    const store = new SessionStore(3600)
+    const session = store.create('42', false, ['dsh:agent-preset:manage'])
+    const agentPresetPlugin = '@deepseek-ai/dsh-client-ui-agent-preset'
+    const handler = createGatewayHandler(
+      ctx,
+      { ...config, distIndex, uiRoleGate: true },
+      store,
+      async () => ({ permissions: [] }),
+    )
+    ctx.effect(() => ctx.webServer.registerFallback(handler), 'gateway')
+    ctx.on('webserver/index-inject', (table) => {
+      table.push({
+        kind: 'global',
+        name: '__DSH_BOOT__',
+        value: {
+          rev: 'rev-1',
+          entries: [{ id: agentPresetPlugin }],
+          batches: [{ entries: [agentPresetPlugin] }],
+        },
+      })
+    })
+
+    const res = await request(port, '/', {
+      headers: { Cookie: `dsh_session=${session.token}` },
+    })
+
+    expect(res.status).toBe(200)
+    expect(res.body).not.toContain(agentPresetPlugin)
+    expect(store.verify(session.token)?.permissions).toEqual([])
+  })
 })
 
 /**

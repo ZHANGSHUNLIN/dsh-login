@@ -173,8 +173,8 @@ web composition / webServer):**
    user. This is the design+boot spike — isolation is currently **not**
    re-established and must not be assumed.
 2. **Client / settings-panel re-home.** `dist/client.js` (the old re-stamped
-   connection bundle + settings-section wrapper) is stale. The 设置→用户管理/账户
-   settings section must become a normal `dsh.client` contribution over the
+   connection bundle + settings-section wrapper) is stale. The 设置→账户 plus
+   admin 用户管理 settings sections must become normal `dsh.client` contributions over the
    enabled connection client, and be rebuilt.
 3. **Host bundle rebuild.** `package.json` `main` is `dist/index.js`; rebuild it
    (`build:host`) with the installed toolchain against the new source.

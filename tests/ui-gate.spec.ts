@@ -89,6 +89,63 @@ describe('filterBootGraph', () => {
     expect(batches[1].rev).toBe('b2')
   })
 
+  it('keeps only UI bundles granted by the authenticated user permissions', () => {
+    const graph = fixtureGraph()
+    const out = filterBootGraph(graph, { isAdmin: false, permissions: ['dsh:plugin:manage'] })!
+    const ids = (out.entries as { id: string }[]).map(row => row.id)
+    expect(ids).toContain(ADMIN_A)
+    expect(ids).not.toContain(ADMIN_B)
+  })
+
+  it('keeps the settings shell so the account launcher remains available', () => {
+    const settingsShell = '@deepseek-ai/dsh-client-ui-settings-general'
+    const settingsModels = '@deepseek-ai/dsh-client-ui-settings-models'
+    const graph = {
+      rev: 'settings-rev',
+      entries: [{ id: settingsShell }, { id: settingsModels }],
+      batches: [{ entries: [settingsShell, settingsModels] }],
+    }
+    const out = filterBootGraph(graph, { isAdmin: false })!
+    expect((out.entries as { id: string }[]).map(entry => entry.id)).toEqual([settingsShell])
+    expect(out.batches).toEqual([{ entries: [settingsShell] }])
+  })
+
+  it('normalizes client entry suffixes before applying permissions', () => {
+    const models = '@deepseek-ai/dsh-client-ui-settings-models/client.js'
+    const graph = {
+      rev: 'suffix-rev',
+      entries: [{ id: models }],
+      batches: [{ entries: [models] }],
+    }
+    const out = filterBootGraph(graph, { isAdmin: false })!
+    expect(out.entries).toEqual([])
+    expect(out.batches).toEqual([])
+  })
+
+  it('gates Agent preset bundles by their dedicated permission', () => {
+    const graph = fixtureGraph()
+    const presetId = '@deepseek-ai/dsh-client-ui-agent-preset'
+    ;(graph.entries as { id: string }[]).push({ id: presetId })
+    ;(graph.batches as { entries: string[] }[]).push({ entries: [presetId] })
+
+    const hidden = filterBootGraph(graph, { isAdmin: false })!
+    expect((hidden.entries as { id: string }[]).some(entry => entry.id === presetId)).toBe(false)
+
+    const visible = filterBootGraph(graph, {
+      isAdmin: false,
+      permissions: ['dsh:agent-preset:manage'],
+    })!
+    expect((visible.entries as { id: string }[]).some(entry => entry.id === presetId)).toBe(true)
+  })
+
+  it('keeps every bundle visible to an Admin identity', () => {
+    const graph = fixtureGraph()
+    const out = filterBootGraph(graph, { isAdmin: true })!
+    expect((out.entries as { id: string }[]).map(entry => entry.id)).toEqual(
+      (graph.entries as { id: string }[]).map(entry => entry.id),
+    )
+  })
+
   it('accepts the filtered graph with the upstream module-graph orderer', () => {
     const graph = fixtureGraph()
     const out = filterBootGraph(graph)!

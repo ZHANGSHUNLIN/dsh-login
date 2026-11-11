@@ -6,9 +6,8 @@
  * factory closure). Under option A (DSH ≥ 0.1.5-alpha.1) the plugin does NOT
  * provide the `connection` service — the shipped `connection` row owns /api —
  * so this half is a standalone settings-section contribution over the native
- * `slots` + `locale`: it registers 用户管理 for admins (user table +
- * create/reset/disable/remove + logout) or 账户 for ordinary users (identity +
- * logout).
+ * `slots` + `locale`: the Admin plugin owns the full 账号 page, while this
+ * bundle contributes 用户管理 for admins (user table + create/reset/disable/remove).
  *
  * All styling runs through the framework's `--dsw-alias-*` theme tokens, so
  * the panel follows the app skin (light/dark) automatically. React and the
@@ -260,6 +259,103 @@ function (require) {
     } catch (err) {
       return undefined
     }
+  }
+
+  // The host's /plugins/events stream sends a complete graph after the page
+  // booted. Keep that stream subject to the same presentation gate as the
+  // server-rendered index, otherwise a reconnect would restore admin panels.
+  var CORE_UI_PLUGINS = new Set([
+    '@islibaodong/dsh-login',
+    '@duhome/dsh-admin-mcp',
+    '@deepseek-ai/dsh-client-ui-settings-general',
+  ])
+  var ADMIN_UI_PLUGINS = new Set([
+    '@deepseek-ai/dsh-client-ui-plugin-manager',
+    '@deepseek-ai/dsh-client-ui-settings-plugin-inventory',
+    '@deepseek-ai/dsh-client-ui-settings-plugins',
+    '@deepseek-ai/dsh-client-ui-agent-preset',
+    '@deepseek-ai/dsh-client-ui-entry-customization',
+    '@deepseek-ai/dsh-client-ui-settings-models',
+    '@deepseek-ai/dsh-client-ui-settings-shell',
+    '@deepseek-ai/dsh-client-ui-settings-agent-loop',
+    '@deepseek-ai/dsh-client-ui-settings-subagent',
+    '@deepseek-ai/dsh-client-ui-settings-web-search',
+    '@deepseek-ai/dsh-client-ui-settings-session-log',
+    '@tencent-connect/dsh-qqbot',
+    '@linxin666/dsh-client-ui-plugin-manager',
+    '@linxin666/dsh-client-ui-market',
+    '@linxin666/dsh-client-ui-community-plugins',
+    '@linxin666/dsh-client-ui-web-ui-settings',
+  ])
+
+  function stripClientSpecifier(spec) {
+    if (spec.endsWith('/client')) return spec.slice(0, -'/client'.length)
+    if (spec.endsWith('/client.js')) return spec.slice(0, -'/client.js'.length)
+    return spec
+  }
+
+  function filterComboUrl(url, removed) {
+    var marker = url.indexOf('??')
+    if (marker === -1) return url
+    var start = marker + 2
+    var suffix = url.indexOf('&', start)
+    var end = suffix === -1 ? url.length : suffix
+    var modules = url.slice(start, end).split(',')
+    var kept = modules.filter(function (spec) { return !removed.has(stripClientSpecifier(spec)) })
+    return kept.length === modules.length ? url : url.slice(0, start) + kept.join(',') + url.slice(end)
+  }
+
+  function filterLiveGraph(graph, access) {
+    if (access === undefined || access.isAdmin === true) return graph
+    if (graph === null || typeof graph !== 'object' || !Array.isArray(graph.entries) || !Array.isArray(graph.batches)) return graph
+    var allowed = new Set(access.capabilities && Array.isArray(access.capabilities.uiPlugins)
+      ? access.capabilities.uiPlugins
+      : [...CORE_UI_PLUGINS])
+    var denied = new Set()
+    var entries = graph.entries.filter(function (entry) {
+      if (entry === null || typeof entry !== 'object' || typeof entry.id !== 'string') return true
+      var id = entry.id
+      var pluginId = stripClientSpecifier(id)
+      // ui-settings-general is the settings shell itself. It owns the
+      // launcher slot used by the Admin account card, so it must remain
+      // mounted for every signed-in user while its privileged child bundles
+      // continue to be filtered below.
+      var gated = ADMIN_UI_PLUGINS.has(pluginId)
+        || (pluginId.startsWith('@deepseek-ai/dsh-client-ui-settings-')
+          && pluginId !== '@deepseek-ai/dsh-client-ui-settings-general')
+        || /agent[-.]?preset/i.test(pluginId)
+      if (gated && !CORE_UI_PLUGINS.has(pluginId) && !allowed.has(pluginId)) {
+        denied.add(id)
+        denied.add(pluginId)
+        return false
+      }
+      return true
+    })
+    if (denied.size === 0) return graph
+    var batches = graph.batches.flatMap(function (batch) {
+      if (batch === null || typeof batch !== 'object' || !Array.isArray(batch.entries)) return [batch]
+      var remaining = batch.entries.filter(function (id) { return !denied.has(id) })
+      if (remaining.length === 0) return []
+      var next = { ...batch, entries: remaining }
+      if (typeof batch.url === 'string') next.url = filterComboUrl(batch.url, denied)
+      return [next]
+    })
+    return { ...graph, entries: entries, batches: batches }
+  }
+
+  function installLiveGraphGate(ctx) {
+    ctx.inject(['modules'], function (sub) {
+      var entries = sub.modules && sub.modules.entries
+      if (entries === undefined || typeof entries.sync !== 'function' || entries.__dshLoginGateInstalled === true) return
+      var originalSync = entries.sync.bind(entries)
+      entries.__dshLoginGateInstalled = true
+      var accessPromise = fetch('/api/auth/capabilities', { credentials: 'same-origin' })
+        .then(function (response) { return response.ok ? response.json() : undefined })
+        .catch(function () { return undefined })
+      entries.sync = function (graph) {
+        return accessPromise.then(function (access) { return originalSync(filterLiveGraph(graph, access)) })
+      }
+    })
   }
 
   function logout() {
@@ -661,6 +757,7 @@ function (require) {
     name: 'dsh-login',
     inject: [],
     apply: function (ctx) {
+      installLiveGraphGate(ctx)
       // Dictionaries + the settings section, registered in a dependency
       // fiber that starts once slots and locale are available.
       ctx.inject(['slots', 'locale'], function (sub) {
@@ -669,21 +766,27 @@ function (require) {
         }, 'dsh-login: settings-panel dictionaries')
         var t = sub.locale.bind(NS)
 
-        // Identity probe: pick the admin (用户管理) or ordinary (账户)
-        // section. Unauthenticated pages never reach the SPA shell (the
-        // gateway redirects first); a failed probe registers nothing.
+        // Identity probe: every authenticated user gets an account section
+        // with a permission-free logout action. Admins additionally get the
+        // 用户管理 section below. Unauthenticated pages never reach the SPA
+        // shell (the gateway redirects first); a failed probe registers
+        // nothing.
         void fetchMe().then(function (me) {
           if (me === undefined) return
           var isAdmin = me.isAdmin === true
-          sub.slots.inject('settings.section', function () {
-            return sub.slots.register({
-              name: 'settings.section',
-              id: isAdmin ? 'users' : 'account',
-              order: 25,
-              label: function () { return t(isAdmin ? 'users.nav' : 'account.nav') },
-              locale: NS,
-            }, function () { return h(isAdmin ? UsersPanel : AccountPanel, { t: t, me: me }) })
-          })
+          var registerSection = function (id, order, labelKey, Component) {
+            sub.slots.inject('settings.section', function () {
+              return sub.slots.register({
+                name: 'settings.section',
+                id: id,
+                order: order,
+                label: function () { return t(labelKey) },
+                locale: NS,
+              }, function () { return h(Component, { t: t, me: me }) })
+            })
+          }
+          if (isAdmin) registerSection('users', 25, 'users.nav', UsersPanel)
+          else registerSection('account', 20, 'account.nav', AccountPanel)
         })
       })
     },

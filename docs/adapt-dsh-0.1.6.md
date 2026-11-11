@@ -102,7 +102,7 @@ seat, `/api/auth/*` routes, and the patch rows are all still owned the same way)
   dsh-login gate (unchanged boundary note from 2026-08-28).
 - What dsh-login can still do (and does): capability discovery
   (`window.__DSH_SESSION__` baseline + `GET /api/auth/capabilities`), its own
-  two-panel settings surface (admin 用户管理 / ordinary 账户), and — for
+  settings surface (all users see 账户; admins additionally see 用户管理), and — for
   deployments that compose it — the remote-guard as the API-layer role
   enforcement.
 - What would make whole-UI role control possible (upstream asks):

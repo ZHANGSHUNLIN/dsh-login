@@ -57,7 +57,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { extractSessionToken } from './auth.ts'
 import type { SessionStore } from './session.ts'
 import type { OwnershipIndex } from './ownership.ts'
-import { USER_ALLOWED, isKnownWireMethod } from './api-filter.ts'
+import { isKnownWireMethod } from './api-filter.ts'
+import { canUseWireMethod } from './dsh-permissions.ts'
 import {
   FILTER_METHODS,
   RECORD_METHODS,
@@ -180,7 +181,7 @@ export function createApiBridgeAuth(deps: ApiBridgeAuthDeps): ApiBridgeAuthListe
       return
     }
     deps.store.cleanup()
-    const user = { username: session.user, isAdmin: session.isAdmin }
+    const user = { username: session.user, isAdmin: session.isAdmin, permissions: session.permissions }
 
     // Enforcement gates only bridge RPCs: the wire is POST-only, so GET/SSE
     // paths (and WS upgrades, which do not ride this waterfall) pass through
@@ -205,12 +206,12 @@ export function createApiBridgeAuth(deps: ApiBridgeAuthDeps): ApiBridgeAuthListe
     }
 
     if (deps.provisioner !== undefined) {
-      void deps.provisioner.ensure(user).catch(() => { /* best-effort */ })
+      void deps.provisioner.ensure({ username: user.username, isAdmin: user.isAdmin }).catch(() => { /* best-effort */ })
     }
 
     const endpoint = endpointFromUrl(request.url)
     if (endpoint === undefined) return next()
-    if (!USER_ALLOWED.has(endpoint)) {
+    if (!canUseWireMethod(endpoint, user)) {
       // Diagnose upstream renames: a known admin method denied here is the
       // ordinary boundary, an unknown one means the allow-list is stale.
       if (!isKnownWireMethod(endpoint)) {

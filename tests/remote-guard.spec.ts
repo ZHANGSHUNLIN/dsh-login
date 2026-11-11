@@ -33,6 +33,17 @@ describe('wrapRemoteGateway (option A isolation glue)', () => {
     expect(g.calls).toHaveLength(0)
   })
 
+  it('allows only methods covered by the resolved user permission codes', async () => {
+    const g = fakeGateway()
+    const permitted = { username: 'alice', isAdmin: false, permissions: ['dsh:plugin:manage'] }
+    const wrapped = wrapRemoteGateway(g, () => permitted, id => owned.has(id))
+    await expect(wrapped.invoke({ namespace: 'pluginManager', method: 'installBundle', args: {} }))
+      .resolves.toEqual({ invoked: 'pluginManager.installBundle' })
+    await expect(wrapped.invoke({ namespace: 'settings', method: 'update', args: {} }))
+      .rejects.toThrow(/forbidden/)
+    expect(g.calls).toHaveLength(1)
+  })
+
   it('denies an ordinary user a method outside the allowed surface', async () => {
     const g = fakeGateway()
     const wrapped = wrapRemoteGateway(g, () => alice, id => owned.has(id))

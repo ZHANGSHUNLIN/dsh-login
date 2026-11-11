@@ -2,8 +2,12 @@ import z from '@deepseek-ai/schemastery'
 
 /** Plugin configuration for the dsh-login authentication gateway. */
 export interface Config {
-  /** Credential reference name for the password (e.g. 'DSH_LOGIN_PASSWORD'). */
-  password: string
+  /** Great Admin base URL including its context path (e.g. http://admin/admin). */
+  adminBaseUrl: string
+  /** Registered Great Admin SSO client ID. */
+  adminClientId: string
+  /** Public URL of this DSH host, needed for the registered callback URI. */
+  publicBaseUrl: string
   /** Absolute path to index.html in the frontend dist directory. When empty,
    * resolved automatically from @deepseek-ai/dsh-web-frontend's exports. */
   distIndex: string
@@ -102,7 +106,9 @@ export interface Config {
 }
 
 export const Config: z<Config> = z.object({
-  password: z.string().required(),
+  adminBaseUrl: z.string().default('http://127.0.0.1:8080/admin'),
+  adminClientId: z.string().default('dsh'),
+  publicBaseUrl: z.string().default(''),
   distIndex: z.string().default(''),
   dataDir: z.string().default(''),
   sessionTtl: z.natural().default(604800),

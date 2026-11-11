@@ -29,7 +29,11 @@ describe('capabilities', () => {
     expect(caps.domains).not.toContain('credentials')
     expect(caps.domains).not.toContain('settings')
     expect(caps.domains).not.toContain('agentPresets')
-    expect(caps.uiPlugins).toEqual(['@islibaodong/dsh-login'])
+    expect(caps.uiPlugins).toEqual([
+      '@islibaodong/dsh-login',
+      '@duhome/dsh-admin-mcp',
+      '@deepseek-ai/dsh-client-ui-settings-general',
+    ])
   })
 
   it('userAllowedMethods matches the allow-list exactly', () => {
@@ -97,6 +101,23 @@ describe('capabilities', () => {
     expect(admin.methods).toContain('pluginManager.removeBundle')
     const caps = deriveCapabilities({ username: 'alice', isAdmin: false })
     expect(caps.methods.some(m => m.startsWith('pluginManager.'))).toBe(false)
+  })
+
+  it('advertises only the UI and methods granted by Admin permission codes', () => {
+    const caps = deriveCapabilities({
+      username: 'alice',
+      isAdmin: false,
+      permissions: ['dsh:settings:manage', 'dsh:agent-preset:manage'],
+    })
+    expect(caps.methods).toContain('settings.update')
+    expect(caps.methods).toContain('agentPresets.select')
+    expect(caps.methods).not.toContain('pluginManager.installBundle')
+    expect(caps.methods).not.toContain('credentials.describe')
+    expect(caps.domains).toContain('settings')
+    expect(caps.domains).toContain('agentPresets')
+    expect(caps.domains).not.toContain('pluginManager')
+    expect(caps.uiPlugins).toContain('@linxin666/dsh-client-ui-web-ui-settings')
+    expect(caps.uiPlugins).not.toContain('@linxin666/dsh-client-ui-plugin-manager')
   })
 
   it('exposes the terminal domain to ordinary users and never denies it', () => {

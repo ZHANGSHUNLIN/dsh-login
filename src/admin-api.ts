@@ -88,7 +88,12 @@ export function createAdminRoutes(deps: AdminDeps): WebRoute[] {
     return sendJson(res, 200, {
       username: session.user,
       isAdmin: session.isAdmin,
-      capabilities: deriveCapabilities({ username: session.user, isAdmin: session.isAdmin }),
+      permissions: session.permissions,
+      capabilities: deriveCapabilities({
+        username: session.user,
+        isAdmin: session.isAdmin,
+        permissions: session.permissions,
+      }),
     })
   } }
 

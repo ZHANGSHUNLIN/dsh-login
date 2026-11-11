@@ -92,7 +92,7 @@ describe('admit shadow (issue #11)', () => {
     const { token } = h.store.create('alice', false)
     const first = h.admit(fakeRequest(`${coreV1}; ${buildCookieHeader(token, 3600)}`))
     expect(first.rejection).toBeUndefined()
-    expect(peerUser(first.peer)).toEqual({ username: 'alice', isAdmin: false })
+    expect(peerUser(first.peer)).toEqual({ username: 'alice', isAdmin: false, permissions: [] })
     const second = h.admit(fakeRequest(`${coreV1}; ${buildCookieHeader(token, 3600)}`))
     expect(second.peer).toBe(first.peer)
     expect((first.peer as { id: string }).id).toBe(h.browserPeer.id)
@@ -115,7 +115,7 @@ describe('admit shadow (issue #11)', () => {
     expect(peerUser(without.peer)).toBeUndefined()
     const withSession = h.admit(fakeRequest(`dsh-auth-v2=credential; ${buildCookieHeader(token, 3600)}`))
     expect(withSession.peer).not.toBe(h.apiPeer)
-    expect(peerUser(withSession.peer)).toEqual({ username: 'bob', isAdmin: false })
+    expect(peerUser(withSession.peer)).toEqual({ username: 'bob', isAdmin: false, permissions: [] })
   })
 
   it('treats an expired session as unauthenticated on the browser path', () => {
@@ -134,8 +134,8 @@ describe('admit shadow (issue #11)', () => {
 
 describe('dispatch shadows (issue #11)', () => {
   const coreV1 = 'dsh-auth-v1=valid'
-  const tagAs = (h: Harness, user: string, isAdmin: boolean): unknown => {
-    const { token } = h.store.create(user, isAdmin)
+  const tagAs = (h: Harness, user: string, isAdmin: boolean, permissions: string[] = []): unknown => {
+    const { token } = h.store.create(user, isAdmin, permissions)
     return h.admit(fakeRequest(`${coreV1}; ${buildCookieHeader(token, 3600)}`)).peer
   }
 
@@ -162,6 +162,20 @@ describe('dispatch shadows (issue #11)', () => {
     const result = await h.gateway.dispatchRpc('credentials/list', { args: {} }, new AbortController().signal, peer)
     expect(result).toEqual(deniedRpc())
     expect(calls(h).dispatchCalls).toHaveLength(0)
+  })
+
+  it('allows only the management methods granted to a tagged user', async () => {
+    const h = harness()
+    const peer = tagAs(h, 'alice', false, ['dsh:agent-preset:manage'])
+    const allowed = await h.gateway.dispatchRpc(
+      'agentPresets/list', { args: {} }, new AbortController().signal, peer,
+    )
+    const denied = await h.gateway.dispatchRpc(
+      'settings/update', { args: {} }, new AbortController().signal, peer,
+    )
+    expect(allowed).toEqual({ ok: true, value: null })
+    expect(denied).toEqual(deniedRpc())
+    expect(calls(h).dispatchCalls).toHaveLength(1)
   })
 
   it('denies unknown wire methods for tagged non-admins (fail closed) and warns once', async () => {

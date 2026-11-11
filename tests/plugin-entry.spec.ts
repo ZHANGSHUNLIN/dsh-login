@@ -8,19 +8,23 @@ import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import HttpServer from '@deepseek-ai/dsh-host-webserver'
 import { MemoryCredentials } from './memory-credentials.ts'
+import { completeAdminSsoLogin } from './sso-helper.ts'
 import * as DshLogin from '../src/index.ts'
 
 let root: string | undefined
 let context: Context | undefined
+let restoreAdminFetch: (() => void) | undefined
 
 afterEach(async () => {
+  restoreAdminFetch?.()
+  restoreAdminFetch = undefined
   await context?.fiber.dispose()
   context = undefined
   if (root !== undefined) await rm(root, { recursive: true, force: true })
   root = undefined
 })
 
-async function loadComposition(): Promise<{ ctx: Context; port: number; distIndex: string; dataDir: string }> {
+async function loadComposition(): Promise<{ ctx: Context; port: number }> {
   root = await mkdtemp(join(tmpdir(), 'dsh-plugin-entry-'))
   const dist = join(root, 'dist')
   await mkdir(dist, { recursive: true })
@@ -33,12 +37,12 @@ async function loadComposition(): Promise<{ ctx: Context; port: number; distInde
     '  config:',
     "    host: '127.0.0.1'",
     '    port: 0',
-    // dsh-login takes over the fallback seat; frontend-static is not
-    // included because both would try to claim the fallback handler.
     "- id: login",
     "  name: '@islibaodong/dsh-login'",
     '  config:',
-    '    password: DSH_LOGIN_PASSWORD',
+    "    adminBaseUrl: 'http://admin.test/admin'",
+    "    adminClientId: 'dsh'",
+    "    publicBaseUrl: ''",
     `    distIndex: '${distIndex}'`,
     `    dataDir: '${dataDir}'`,
     '    sessionTtl: 3600',
@@ -63,139 +67,92 @@ async function loadComposition(): Promise<{ ctx: Context; port: number; distInde
   await context.loader.create({ name: 'cordis:include', config: { path: pathToFileURL(configPath).href } })
   await context.loader.await()
   await context.plugin(MemoryCredentials)
-  return { ctx: context, port: context.webServer.port, distIndex, dataDir }
+  return { ctx: context, port: context.webServer.port }
 }
 
-async function request(port: number, path: string, init?: RequestInit): Promise<{ status: number; body: string; headers: Headers }> {
-  const res = await fetch(`http://127.0.0.1:${String(port)}${path}`, { ...init, redirect: 'manual' })
-  return { status: res.status, body: await res.text(), headers: res.headers }
+async function request(port: number, path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`http://127.0.0.1:${String(port)}${path}`, { ...init, redirect: 'manual' })
 }
 
-async function postJson(port: number, path: string, body: unknown, cookie?: string): Promise<{ status: number; json: unknown; headers: Headers }> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (cookie !== undefined) headers['Cookie'] = cookie
-  const res = await fetch(`http://127.0.0.1:${String(port)}${path}`, { method: 'POST', headers, body: JSON.stringify(body) })
-  const text = await res.text()
-  let json: unknown = null
-  try { json = JSON.parse(text) } catch { /* not JSON */ }
-  return { status: res.status, json, headers: res.headers }
-}
-
-/** First-time setup: create the root admin through the setup endpoint. */
-async function setupAdmin(port: number, password: string): Promise<string> {
-  const res = await postJson(port, '/api/auth/setup', { username: 'root', password })
-  if (res.status !== 200) throw new Error(`setup failed: ${String(res.status)}`)
-  return res.headers.get('set-cookie')!.split(';')[0]!
-}
-
-describe('dsh-login plugin (full composition)', () => {
-  it('provides webApp (getAdvertisedUrl) so the alpha.3 harness-dev-context row injects', { timeout: 60_000 }, async () => {
-    // DSH 0.2.1-alpha.3: dsh-login disables the web-runtime row, which was
-    // the only provider of `webApp`; the new harness-dev-context row reads
-    // `webApp.getAdvertisedUrl()`. Boot the real composition and check the
-    // service exists with the canonical loopback origin of the bound server.
+describe('dsh-login plugin (Admin SSO composition)', () => {
+  it('provides webApp (getAdvertisedUrl) for the DSH host', { timeout: 60_000 }, async () => {
     const { ctx, port } = await loadComposition()
     expect(ctx.webApp).toBeDefined()
     expect(ctx.webApp.getAdvertisedUrl()).toBe(`http://127.0.0.1:${String(port)}`)
   })
 
-  it('protects the root with a redirect to /login when unauthenticated', { timeout: 60_000 }, async () => {
+  it('redirects unauthenticated page requests to the Admin-only login page', { timeout: 60_000 }, async () => {
     const { port } = await loadComposition()
-    const res = await request(port, '/')
-    expect(res.status).toBe(302)
-    expect(res.headers.get('location')).toBe('/login')
+    const response = await request(port, '/')
+    expect(response.status).toBe(302)
+    expect(response.headers.get('location')).toBe('/login')
+    const loginPage = await request(port, '/login')
+    expect(await loginPage.text()).toContain('href="/api/auth/login"')
   })
 
-  it('shows the setup form at /login while no user exists', { timeout: 60_000 }, async () => {
+  it('offers a password-login redirect that preserves the SSO request', { timeout: 60_000 }, async () => {
     const { port } = await loadComposition()
-    const res = await request(port, '/login')
-    expect(res.status).toBe(200)
-    expect(res.body).toContain('/api/auth/setup')
-    expect(res.body).toContain('name="username"')
+    const response = await request(port, '/api/auth/login?mode=password')
+    expect(response.status).toBe(302)
+    const location = new URL(response.headers.get('location')!)
+    expect(location.pathname).toBe('/admin/login')
+    const redirect = new URL(location.searchParams.get('redirect')!, 'http://admin.test')
+    expect(redirect.pathname).toBe('/admin/sso/authorize')
+    expect(redirect.searchParams.get('client_id')).toBe('dsh')
+    expect(redirect.searchParams.get('redirect_uri')).toContain('/api/auth/callback')
+    expect(redirect.searchParams.get('state')).toBeTruthy()
   })
 
-  it('shows the login form (with username field) once users exist', { timeout: 60_000 }, async () => {
+  it('creates a DSH session only after Admin SSO callback and userinfo verification', { timeout: 60_000 }, async () => {
     const { port } = await loadComposition()
-    await setupAdmin(port, 's3cret')
-    const res = await request(port, '/login')
-    expect(res.status).toBe(200)
-    expect(res.body).toContain('/api/auth/login')
-    expect(res.body).toContain('name="username"')
-    expect(res.body).not.toContain('/api/auth/setup')
+    const { cookie, restoreFetch } = await completeAdminSsoLogin(port)
+    restoreAdminFetch = restoreFetch
+    const response = await request(port, '/api/auth/me', { headers: { Cookie: cookie } })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      userId: 42,
+      username: 'alice',
+      displayName: 'Alice',
+      roles: ['OPERATOR'],
+      permissions: ['dsh:settings:manage', 'dsh:plugin:manage', 'dsh:agent-preset:manage'],
+      expiresAt: '2099-01-01T00:00:00Z',
+      isAdmin: false,
+    })
+    expect((await request(port, '/', { headers: { Cookie: cookie } })).status).toBe(200)
   })
 
-  it('completes setup -> logout -> username login -> access -> logout', { timeout: 60_000 }, async () => {
+  it('rejects an unbound callback and leaves local setup/login routes unavailable', { timeout: 60_000 }, async () => {
     const { port } = await loadComposition()
+    const callback = await request(port, '/api/auth/callback?code=not-issued&state=invalid')
+    expect(callback.status).toBe(400)
+    const setup = await request(port, '/api/auth/setup', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'root', password: 'pw' }),
+    })
+    expect(setup.status).toBe(405)
+    const localLogin = await request(port, '/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'root', password: 'pw' }),
+    })
+    expect(localLogin.status).toBe(302)
+    expect(new URL(localLogin.headers.get('location')!).pathname).toBe('/admin/sso/authorize')
+  })
 
-    const setupCookie = await setupAdmin(port, 's3cret')
-    expect(setupCookie).toContain('dsh_session=')
-    expect((await request(port, '/', { headers: { Cookie: setupCookie } })).status).toBe(200)
-
-    // End the setup session, then log in through the normal flow.
-    await postJson(port, '/api/auth/logout', {}, setupCookie)
-    expect((await request(port, '/', { headers: { Cookie: setupCookie } })).status).toBe(302)
-
-    const bad = await postJson(port, '/api/auth/login', { username: 'root', password: 'wrong' })
-    expect(bad.status).toBe(401)
-
-    const missing = await postJson(port, '/api/auth/login', { password: 's3cret' })
-    expect(missing.status).toBe(400)
-
-    const login = await postJson(port, '/api/auth/login', { username: 'root', password: 's3cret' })
-    expect(login.status).toBe(200)
-    const cookie = login.headers.get('set-cookie')!.split(';')[0]!
-
-    const after = await request(port, '/', { headers: { Cookie: cookie } })
-    expect(after.status).toBe(200)
-    expect(after.body).toContain('shell')
-
-    expect((await postJson(port, '/api/auth/logout', {}, cookie)).status).toBe(200)
+  it('same-origin logout revokes the session', { timeout: 60_000 }, async () => {
+    const { port } = await loadComposition()
+    const { cookie } = await completeAdminSsoLogin(port)
+    const origin = `http://127.0.0.1:${String(port)}`
+    const logout = await request(port, '/api/auth/logout', {
+      method: 'POST', headers: { Cookie: cookie, Origin: origin },
+    })
+    expect(logout.status).toBe(200)
     expect((await request(port, '/', { headers: { Cookie: cookie } })).status).toBe(302)
+    expect((await request(port, '/api/auth/me', { headers: { Cookie: cookie } })).status).toBe(401)
   })
 
-  it('serves /api/auth/me for the live session', { timeout: 60_000 }, async () => {
+  it('does not mount an /api takeover', { timeout: 60_000 }, async () => {
     const { port } = await loadComposition()
-    const cookie = await setupAdmin(port, 's3cret')
-    const me = await request(port, '/api/auth/me', { headers: { Cookie: cookie } })
-    expect(me.status).toBe(200)
-    expect(JSON.parse(me.body)).toEqual({ username: 'root', isAdmin: true })
-    const anon = await request(port, '/api/auth/me')
-    expect(anon.status).toBe(401)
-  })
-
-  it('serves the admin JSON routes for admins; the standalone /admin page is gone', { timeout: 60_000 }, async () => {
-    const { port } = await loadComposition()
-    // The exact /admin route was removed (user management moved into the
-    // GUI settings panel); anonymous hits fall through to the gateway
-    // fallback, which redirects to /login.
-    const anon = await request(port, '/admin')
-    expect(anon.status).toBe(302)
-    expect(anon.headers.get('location')).toBe('/login')
-
-    const cookie = await setupAdmin(port, 's3cret')
-
-    const created = await postJson(port, '/api/auth/admin/users', { username: 'alice', password: 'apw' }, cookie)
-    expect(created.status).toBe(201)
-
-    const list = await request(port, '/api/auth/admin/users', { headers: { Cookie: cookie } })
-    expect(list.status).toBe(200)
-    const body = JSON.parse(list.body) as { users: Array<{ username: string }> }
-    expect(body.users.map(u => u.username).sort()).toEqual(['alice', 'root'])
-  })
-
-  it('no longer mounts an /api takeover (option A: upstream connection owns /api)', { timeout: 60_000 }, async () => {
-    const { port } = await loadComposition()
-    const cookie = await setupAdmin(port, 's3cret')
-
-    // Under option A (DSH ≥ 0.1.5-alpha.1) dsh-login does not claim the /api
-    // prefix — the native `connection` row does. In this test composition there
-    // is no connection row either, so a POST to /api reaches the gateway
-    // fallback, which answers 405 (fallback-only semantics). A 405 (rather than
-    // the old takeover's 404 api===undefined arm) proves no duplicate /api
-    // prefix route is mounted here.
-    const anon = await request(port, '/api/sessions.list', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
-    expect(anon.status).toBe(405)
-    const authed = await request(port, '/api/sessions.list', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: '{}' })
-    expect(authed.status).toBe(405)
+    const response = await request(port, '/api/sessions.list', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    })
+    expect(response.status).toBe(405)
   })
 })

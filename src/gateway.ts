@@ -206,6 +206,7 @@ export function createGatewayHandler(
   ctx: Context,
   config: Config,
   store: SessionStore,
+  currentIdentity?: (userId: string) => Promise<{ permissions: readonly string[] } | undefined>,
 ): WebRoute['handler'] {
   const distRoot = dirname(config.distIndex)
   const renderIndex = indexRenderer(ctx, config.distIndex)
@@ -235,7 +236,18 @@ export function createGatewayHandler(
     // verified above, so the per-request closure sees the live identity.
     // Admins (and deployments with the gate off) get the unmodified render.
     const render = config.uiRoleGate && !session.isAdmin
-      ? async (): Promise<string> => applyUiGate(await renderIndex())
+      ? async (): Promise<string> => {
+          let currentSession = session
+          if (currentIdentity !== undefined) {
+            const identity = await currentIdentity(session.user)
+            store.updatePermissionsForUser(session.user, identity?.permissions ?? [])
+            currentSession = store.verify(token) ?? { ...session, permissions: [] }
+          }
+          return applyUiGate(await renderIndex(), {
+            isAdmin: currentSession.isAdmin,
+            permissions: currentSession.permissions,
+          })
+        }
       : renderIndex
     await serveStatic(
       decodeURIComponent(rawPath),

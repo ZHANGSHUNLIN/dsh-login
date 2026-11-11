@@ -50,6 +50,8 @@ export interface DshLoginIsolationDeps {
    * this only matters for deployments that resolve users outside the sidecar.
    */
   isAdmin?: (username: string) => boolean
+  /** Effective Admin permission codes for the user; omitted permissions fail closed. */
+  permissionsForUser?: (userId: string) => readonly string[]
 }
 
 /**
@@ -62,6 +64,7 @@ export function createDshLoginIsolation(deps: DshLoginIsolationDeps): { resolveU
     ownership: deps.ownership,
     currentSessionId: deps.currentSessionId ?? (() => undefined),
     isAdmin: deps.isAdmin,
+    permissions: deps.permissionsForUser,
   })
 }
 
@@ -97,8 +100,21 @@ export function composeDshLoginGuard<G extends RemoteGateway>(ctx: Context, gate
   const isolation = createDshLoginIsolation({
     ownership,
     currentSessionId: () => agents?.currentInitiator?.()?.id,
+    permissionsForUser: dshLoginPermissionLookup(ctx),
   })
   return composeGuardedGateway(gateway, isolation)
+}
+
+function dshLoginPermissionLookup(ctx: Context): (userId: string) => readonly string[] {
+  return (userId) => {
+    try {
+      const get = ctx.get as unknown as (this: Context, key: string) => unknown
+      const auth = get.call(ctx, 'dshLoginAuth') as { permissionsForUser?: (id: string) => readonly string[] } | undefined
+      return auth?.permissionsForUser?.(userId) ?? []
+    } catch {
+      return []
+    }
+  }
 }
 
 export type { GuardUser, OwnedPredicate, RemoteGateway, UserResolver, WrappedRemoteGateway }

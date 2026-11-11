@@ -6,8 +6,11 @@ import { dirname } from 'node:path'
 /** One created login session: token, owning user, and expiry timestamps. */
 export interface Session {
   token: string
+  /** Stable Admin user ID. This value is also the ownership key. */
   user: string
   isAdmin: boolean
+  permissions: string[]
+  authSource: 'admin-sso'
   createdAt: number
   expiresAt: number
 }
@@ -18,14 +21,11 @@ const SAVE_DEBOUNCE_MS = 200
 /**
  * Session token store with automatic TTL expiry.
  *
- * In-memory map is authoritative for the running process. When a `filePath` is
- * supplied (production — `<dataDir>/sessions.json`), sessions are persisted on
- * every mutation with a debounced, best-effort write, and restored on boot, so
- * a process restart (or a plugin reload while testing) does not silently
- * invalidate every existing login cookie — which previously turned an already-
- * loaded SPA's next `/api` call into a 401 while the page itself redirected to
- * /login only on a full reload. Tokens are written with `0o600`; the file is
- * fail-closed on boot (unreadable/corrupt → start empty).
+ * In-memory map is authoritative for the running process. This Admin SSO
+ * integration intentionally constructs the store without a file path, so a
+ * Host restart invalidates DSH cookies rather than persisting Admin sessions
+ * beyond the in-memory refresh-token lifetime. Optional persistence remains
+ * available to callers that explicitly provide a file path.
  */
 export class SessionStore {
   private readonly store = new Map<string, Session>()
@@ -39,14 +39,33 @@ export class SessionStore {
     if (filePath !== undefined) this.load()
   }
 
-  /** Generate a 32-byte random token for `user` with its admin flag. */
-  create(user: string, isAdmin: boolean): Session {
+  /** Generate a 32-byte random DSH token for an Admin user ID. */
+  create(user: string, isAdmin: boolean, permissions: readonly string[] = []): Session {
     const token = randomBytes(32).toString('hex')
     const createdAt = Date.now()
-    const session: Session = { token, user, isAdmin, createdAt, expiresAt: createdAt + this.ttlSeconds * 1000 }
+    const session: Session = {
+      token,
+      user,
+      isAdmin,
+      permissions: [...new Set(permissions)],
+      authSource: 'admin-sso',
+      createdAt,
+      expiresAt: createdAt + this.ttlSeconds * 1000,
+    }
     this.store.set(token, session)
     this.scheduleSave()
     return session
+  }
+
+  updatePermissionsForUser(user: string, permissions: readonly string[]): void {
+    const next = [...new Set(permissions)]
+    let changed = false
+    for (const [token, session] of this.store) {
+      if (session.user !== user) continue
+      this.store.set(token, { ...session, permissions: next })
+      changed = true
+    }
+    if (changed) this.scheduleSave()
   }
 
   /** Return the live session for a token, or undefined. */
@@ -62,14 +81,33 @@ export class SessionStore {
     return session
   }
 
+  lookupUser(token: string): string | undefined {
+    return this.verify(token)?.user
+  }
+
+  hasUser(userId: string): boolean {
+    for (const token of this.store.keys()) {
+      const session = this.verify(token)
+      if (session?.user === userId) return true
+    }
+    return false
+  }
+
+  permissionsForUser(userId: string): string[] {
+    for (const session of this.store.values()) {
+      if (session.user === userId && Date.now() <= session.expiresAt) return [...session.permissions]
+    }
+    return []
+  }
+
   /** Remove a session. Revoking an unknown token is a no-op. */
   revoke(token: string): void {
     if (this.store.delete(token)) this.scheduleSave()
   }
 
   /**
-   * Revoke every live session belonging to `user` (user removal or password
-   * change). Returns the number of sessions removed.
+   * Revoke every live session belonging to an Admin user ID. Returns the
+   * number of sessions removed.
    */
   revokeAllFor(user: string): number {
     let removed = 0
@@ -84,8 +122,7 @@ export class SessionStore {
   }
 
   /**
-   * Count live (unexpired) sessions per username. Used by the admin user
-   * list to report online status; expired entries are swept along the way.
+   * Count live (unexpired) sessions per Admin user ID.
    */
   onlineCounts(): Map<string, number> {
     const counts = new Map<string, number>()
@@ -135,10 +172,19 @@ export class SessionStore {
       for (const entry of list) {
         if (typeof entry !== 'object' || entry === null) continue
         const s = entry as Partial<Session>
-        if (typeof s.token !== 'string' || typeof s.user !== 'string' || typeof s.isAdmin !== 'boolean') continue
+        // Local-account sessions from older versions are intentionally invalidated.
+        if (s.authSource !== 'admin-sso' || typeof s.token !== 'string' || typeof s.user !== 'string' || typeof s.isAdmin !== 'boolean') continue
         if (typeof s.createdAt !== 'number' || typeof s.expiresAt !== 'number') continue
         if (now > s.expiresAt) continue // already expired: drop on load
-        this.store.set(s.token, { token: s.token, user: s.user, isAdmin: s.isAdmin, createdAt: s.createdAt, expiresAt: s.expiresAt })
+        this.store.set(s.token, {
+          token: s.token,
+          user: s.user,
+          isAdmin: false,
+          permissions: Array.isArray(s.permissions) ? s.permissions : [],
+          authSource: 'admin-sso',
+          createdAt: s.createdAt,
+          expiresAt: s.expiresAt,
+        })
       }
     } catch { /* absent or corrupt: start empty (fail-closed) */ }
   }

@@ -77,8 +77,15 @@ function makeCtx() {
   const ctx = {
     ...base,
     inject: (deps: string[], callback: (sub: typeof base) => void) => {
-      expect(deps).toEqual(['slots', 'locale'])
-      callback(base)
+      if (deps.length === 1 && deps[0] === 'modules') {
+        callback({
+          ...base,
+          modules: { entries: { sync: () => Promise.resolve() } },
+        } as typeof base)
+      } else {
+        expect(deps).toEqual(['slots', 'locale'])
+        callback(base)
+      }
       return Promise.resolve()
     },
   }

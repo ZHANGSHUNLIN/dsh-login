@@ -53,6 +53,7 @@ import { extractSessionToken } from './auth.ts'
 import type { SessionStore } from './session.ts'
 import type { OwnershipIndex } from './ownership.ts'
 import { classifyWireMethod } from './api-filter.ts'
+import { canUseWireMethod } from './dsh-permissions.ts'
 import { collectIds, GUARDED_ID_FIELDS } from './remote-guard.ts'
 import { probeOwnedSessionIds } from './bridge-list-filter.ts'
 import type { SessionListSource } from './bridge-list-filter.ts'
@@ -72,6 +73,7 @@ const PEER_USER: unique symbol = Symbol('dsh-login.peer-user')
 export interface PeerUser {
   username: string
   isAdmin: boolean
+  permissions?: string[]
 }
 
 /** Minimal peer surface the guards rely on (a superset is fine). */
@@ -141,7 +143,10 @@ export function peerUser(peer: unknown): PeerUser | undefined {
   if (typeof user !== 'object' || user === null) return undefined
   const username = (user as { username?: unknown }).username
   if (typeof username !== 'string' || username === '') return undefined
-  return { username, isAdmin: user.isAdmin === true }
+  const permissions = Array.isArray(user.permissions)
+    ? user.permissions.filter((permission): permission is string => typeof permission === 'string')
+    : []
+  return { username, isAdmin: user.isAdmin === true, permissions }
 }
 
 /** Resolve the dsh-login user behind an incoming request (cookie → session). */
@@ -150,7 +155,7 @@ export function userFromRequest(request: Pick<IncomingMessage, 'headers'>, store
   if (token === undefined) return undefined
   const session = store.verify(token)
   if (session === undefined) return undefined
-  return { username: session.user, isAdmin: session.isAdmin }
+  return { username: session.user, isAdmin: session.isAdmin, permissions: session.permissions }
 }
 
 /**
@@ -191,7 +196,14 @@ export function installAdmitShadow(
     if (token !== undefined) {
       const session = deps.store.verify(token)
       if (session !== undefined) {
-        return { ...admission, peer: wrapTagged(admission.peer, { username: session.user, isAdmin: session.isAdmin }, token, wrappers) }
+        return {
+          ...admission,
+          peer: wrapTagged(admission.peer, {
+            username: session.user,
+            isAdmin: session.isAdmin,
+            permissions: session.permissions,
+          }, token, wrappers),
+        }
       }
     }
     return isBrowser ? { rejection: 401 } : admission
@@ -313,7 +325,7 @@ function dispatchVerdict(
   if (parts.length !== 2) return 'pass'
   const dotted = `${parts[0]}.${parts[1]}`
   const classification = classifyWireMethod(dotted)
-  if (classification !== 'user') {
+  if (!canUseWireMethod(dotted, user)) {
     if (classification === 'unknown' && !warnedUnknown.has(dotted)) {
       warnedUnknown.add(dotted)
       warn(`dsh-login: stream guard denied unknown wire method '${dotted}' — upstream may have renamed it; refresh src/api-filter.ts`)

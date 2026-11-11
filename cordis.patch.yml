@@ -4,11 +4,9 @@
 #   dsh plugin --profile web add github:islibaodong/dsh-login
 # (this file is declared in package.json's dsh.bundle.patch).
 #
-# Accounts: no pre-configuration needed. On first visit the /login page shows
-# a setup form that creates the administrator account (username + password,
-# scrypt-hashed in the DSH credentials system under ref
-# DSH_LOGIN_PASSWORD_USERS); admins then manage users from the GUI settings
-# panel (设置→用户管理).
+# Identity: dsh-login delegates sign-in to Great Admin SSO. Register the exact
+# callback URI `/api/auth/callback` in Great Admin and set publicBaseUrl when
+# DSH is reached through a reverse proxy or public tunnel.
 #
 # IMPORTANT: dsh-login claims the webserver fallback seat (the single
 # seat for everything no named route claims). The dsh-web-app bundle's
@@ -30,7 +28,9 @@
     - id: dsh-login
       name: '@islibaodong/dsh-login'
       config:
-        password: DSH_LOGIN_PASSWORD
+        adminBaseUrl: !!js process.env.DUHOME_ADMIN_BASE_URL ?? 'http://127.0.0.1:8080/admin'
+        adminClientId: dsh
+        publicBaseUrl: !!js process.env.DUHOME_ADMIN_DSH_PUBLIC_URL ?? ''
         # distIndex: '' resolves @deepseek-ai/dsh-web-frontend/dist automatically.
         sessionTtl: 604800
         takeOverWebRuntime: true

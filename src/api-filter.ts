@@ -47,7 +47,7 @@
  * fails the build instead of silently denying a user feature.
  */
 
-export interface AuthUser { username: string; isAdmin: boolean }
+export interface AuthUser { username: string; isAdmin: boolean; permissions?: readonly string[] }
 
 /** DSH release the snapshots in this file were transcribed from. */
 export const WIRE_SURFACE_DSH_VERSION = '0.2.2-rc.1'

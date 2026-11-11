@@ -45,6 +45,16 @@ describe('SessionStore', () => {
     expect(store.verify(session.token)).toBeDefined()
   })
 
+  it('stores and refreshes permission codes for all sessions of a user', () => {
+    const store = new SessionStore(3600)
+    const first = store.create('42', false, ['dsh:settings:manage'])
+    const second = store.create('42', false, [])
+    store.updatePermissionsForUser('42', ['dsh:plugin:manage'])
+    expect(store.verify(first.token)?.permissions).toEqual(['dsh:plugin:manage'])
+    expect(store.verify(second.token)?.permissions).toEqual(['dsh:plugin:manage'])
+    expect(store.permissionsForUser('42')).toEqual(['dsh:plugin:manage'])
+  })
+
   it('rejects an unknown token', () => {
     const store = new SessionStore(3600)
     expect(store.verify('deadbeef')).toBeUndefined()
@@ -138,13 +148,13 @@ describe('SessionStore persistence', () => {
     expect(restored?.token).toBe(session.token)
   })
 
-  it('persists admin flag across a restart', async () => {
+  it('restores persisted sessions with ordinary-user capabilities', async () => {
     const path = tmpFile()
     const first = new SessionStore(3600, path)
     const admin = first.create('root', true)
     await first.flush()
     const restored = new SessionStore(3600, path).verify(admin.token)
-    expect(restored?.isAdmin).toBe(true)
+    expect(restored?.isAdmin).toBe(false)
   })
 
   it('drops expired entries on load', async () => {

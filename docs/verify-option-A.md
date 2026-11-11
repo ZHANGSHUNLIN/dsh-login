@@ -40,7 +40,7 @@ dsh web
   "Log out → visiting / and any static asset (e.g. /assets/*.js) must 302 → /login.",
   "Log in → the SPA must fully load (chat UI, history, composer).",
   "Check DevTools → Network: after login, index should carry the upstream browser-session cookie (dsh-auth-*) so /api/* calls succeed (200, not 401/404).",
-  "The 设置 panel must show 用户管理 for admin, 账户 for ordinary users (set-ting panel client re-home, item iii)."
+  "The 设置 panel must show 账户 for every signed-in user and 用户管理 for admin (settings-panel client re-home, item iii)."
  ]}
 ]}
 ```

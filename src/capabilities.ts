@@ -29,8 +29,9 @@
  * restates "not here for you" in a form the browser does not treat as an
  * error.
  */
-import { ADMIN_ONLY_METHODS, USER_ALLOWED } from './api-filter.ts'
+import { USER_ALLOWED } from './api-filter.ts'
 import type { AuthUser } from './api-filter.ts'
+import { CORE_UI_PLUGINS, permittedUiPlugins, permittedWireMethods } from './dsh-permissions.ts'
 
 /** Single-segment RpcMethodMap methods an ordinary user may call (physical layer). */
 export function userAllowedMethods(): string[] {
@@ -102,6 +103,20 @@ export const USER_DOMAINS: readonly string[] = [
  * package whose panels drive those domains.
  */
 export const ADMIN_ONLY_UI_PLUGINS: readonly string[] = [
+  // DSH 0.2.2 built-in admin surfaces.
+  '@deepseek-ai/dsh-client-ui-plugin-manager',
+  '@deepseek-ai/dsh-client-ui-settings-plugin-inventory',
+  '@deepseek-ai/dsh-client-ui-settings-plugins',
+  '@deepseek-ai/dsh-client-ui-agent-preset',
+  '@deepseek-ai/dsh-client-ui-entry-customization',
+  '@deepseek-ai/dsh-client-ui-settings-models',
+  '@deepseek-ai/dsh-client-ui-settings-shell',
+  '@deepseek-ai/dsh-client-ui-settings-agent-loop',
+  '@deepseek-ai/dsh-client-ui-settings-subagent',
+  '@deepseek-ai/dsh-client-ui-settings-web-search',
+  '@deepseek-ai/dsh-client-ui-settings-session-log',
+  '@tencent-connect/dsh-qqbot',
+  // Older community bundle ids kept for mixed-version profiles.
   '@linxin666/dsh-client-ui-plugin-manager',
   '@linxin666/dsh-client-ui-skill-explorer',
   '@linxin666/dsh-client-ui-skin-center',
@@ -117,11 +132,6 @@ export const ADMIN_ONLY_UI_PLUGINS: readonly string[] = [
   '@linxin666/dsh-ssh',
   '@linxin666/dsh-perf',
   '@linxin666/dsh-liangshen',
-]
-
-/** UI plugin ids always available (the login gateway's own panel + model core). */
-const CORE_UI_PLUGINS: readonly string[] = [
-  '@islibaodong/dsh-login',
 ]
 
 /** Capabilities advertised for one identity. */
@@ -141,42 +151,13 @@ export interface Capabilities {
  * @param user - the authenticated identity.
  */
 export function deriveCapabilities(user: AuthUser): Capabilities {
-  if (user.isAdmin) {
-    return {
-      methods: userAllowedMethods().concat(adminOnlyMethods()),
-      domains: allDomains(),
-      uiPlugins: CORE_UI_PLUGINS.concat(allUiPlugins()),
-    }
-  }
+  const methods = permittedWireMethods(user)
+  const uiPlugins = permittedUiPlugins(CORE_UI_PLUGINS.concat(ADMIN_ONLY_UI_PLUGINS), user)
   return {
-    methods: userAllowedMethods(),
-    domains: [...USER_DOMAINS],
-    uiPlugins: [...CORE_UI_PLUGINS],
+    methods,
+    domains: [...new Set(methods.map(method => method.slice(0, method.indexOf('.'))))].sort(),
+    uiPlugins,
   }
-}
-
-/**
- * Methods an admin may additionally call (the allow-list does not carry them).
- *
- * This is the exact complement of the ordinary-user allow-list within the wire
- * surface (`src/api-filter.ts` ADMIN_ONLY_METHODS + HOST_INTERNAL_METHODS), so
- * the advertisement is complete instead of the curated sample it used to be —
- * that sample still named `credentials.list`, `host.path` and
- * `pluginRegistryProbe.list`, none of which exist on this wire line.
- */
-function adminOnlyMethods(): string[] {
-  return [...ADMIN_ONLY_METHODS]
-}
-
-/** Every user domain plus the admin-only ones. */
-function allDomains(): string[] {
-  const admin = [...new Set([...ADMIN_ONLY_METHODS].map(m => m.slice(0, m.indexOf('.'))))]
-  return [...new Set([...USER_DOMAINS, ...admin])].sort()
-}
-
-/** Every UI plugin id (core + admin-only). */
-function allUiPlugins(): string[] {
-  return [...CORE_UI_PLUGINS, ...ADMIN_ONLY_UI_PLUGINS]
 }
 
 /**

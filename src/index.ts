@@ -1,6 +1,5 @@
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { credentialRef } from '@deepseek-ai/dsh-credentials'
 // Type-only: pulls in the `connection/request` Events augmentation (DSH
 // ≥ 0.1.6-alpha.2) so the bridge wall below typechecks. Erased at build.
 import type {} from '@deepseek-ai/dsh-client-connection'
@@ -8,7 +7,6 @@ import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { Config } from './config.ts'
 import { Config as ConfigSchema } from './config.ts'
 import { SessionStore } from './session.ts'
-import { UserStore } from './users.ts'
 import { OwnershipIndex } from './ownership.ts'
 import { TrustedHosts } from './hosts.ts'
 import { DefaultWorkspaceSetting } from './workspace-setting.ts'
@@ -21,9 +19,8 @@ import { WIRE_SURFACE_DSH_VERSION } from './api-filter.ts'
 import { DefaultWorkspaceProvisioner, type WorkspaceRegistryLike } from './provision.ts'
 import { createHostSessionApi, createHostSessionSource, tryGetService } from './host-session-access.ts'
 import { probeOwnedSessionIds } from './bridge-list-filter.ts'
-import { createLoginHandler, createLogoutHandler, createLogoutRedirectHandler, createSetupHandler } from './login-api.ts'
-import { createAdminRoutes } from './admin-api.ts'
-import { renderLoginPage, renderSetupPage } from './login-page.ts'
+import { renderLoginPage } from './login-page.ts'
+import { createAdminSso } from './admin-sso.ts'
 import { provideWebRuntime, resolveDistIndex } from './web-runtime.ts'
 import { resolveDshHome } from './http-json.ts'
 import { deriveCapabilities } from './capabilities.ts'
@@ -31,8 +28,8 @@ import { deriveCapabilities } from './capabilities.ts'
 /** Stable Cordis plugin name. */
 export const name = 'dsh-login'
 
-/** Hard dependencies: the web server and credentials services. */
-export const inject = ['webServer', 'credentials']
+/** Hard dependency: the DSH web server. */
+export const inject = ['webServer']
 
 export { ConfigSchema as Config }
 
@@ -67,11 +64,7 @@ export type { DshLoginIsolationDeps, WrappedRemoteGateway } from './glue.ts'
 /**
  * Register the multi-user authentication gateway on the web server:
  *
- * - Login/logout/setup JSON API (`{username, password}` against the
- *   UserStore — scrypt hashes stored under the `${password}_USERS`
- *   credential ref; the old single-password ref itself stays configured but
- *   is no longer used for authentication).
- * - Admin JSON API + `GET /admin` management page (admin sessions only).
+ * - Admin SSO login/callback and a DSH-owned HttpOnly session.
  * - The identity-aware `/api` carrier takeover (`createConnectionPlugin`)
  *   mounted as a child plugin, and the OwnershipIndex sidecar with a
  *   teardown flush so pending ownership writes reach disk on stop/update.
@@ -85,31 +78,35 @@ export type { DshLoginIsolationDeps, WrappedRemoteGateway } from './glue.ts'
 export function apply(ctx: Context, config: Config): void {
   if (!config.enabled) return
   const dataDir = config.dataDir === '' ? join(resolveDshHome(), '.dsh-login') : config.dataDir
-  // Persisted session store: sessions survive a process restart (so an already
-  // open SPA's /api calls are not suddenly 401'd — the in-memory-only store
-  // invalidated every cookie on reload). Tokens live in <dataDir>/sessions.json
-  // (0o600). Session TTL still applies on load, so stale records are dropped.
-  const store = new SessionStore(config.sessionTtl, join(dataDir, 'sessions.json'))
-  const users = new UserStore(ctx.credentials, credentialRef(`${config.password}_USERS`))
-  const ownership = new OwnershipIndex(join(dataDir, 'ownership.json'))
+  // Admin refresh tokens stay memory-only, so DSH sessions cannot outlive a Host restart.
+  const store = new SessionStore(config.sessionTtl)
+  // Keep the username-keyed sidecar untouched; the Admin-ID index starts fresh.
+  const ownership = new OwnershipIndex(join(dataDir, 'ownership-v2.json'))
   const hosts = new TrustedHosts(join(dataDir, 'trusted-hosts.json'))
-  // Live + persisted "默认用户工作空间" toggle: starts from config.defaultWorkspace
-  // (default on) and can be flipped by an admin at runtime from the settings
-  // panel. The provisioner reads it per request, so the toggle binds immediately.
+  // The persisted workspace setting starts from config.defaultWorkspace and is
+  // read by the provisioner for each request.
   const defaultWorkspaceSetting = new DefaultWorkspaceSetting(join(dataDir, 'settings.json'), config.defaultWorkspace)
-  // Live + persisted "remote-web-ui 兼容" toggle: when on (default), dsh-login
+  // The persisted "remote-web-ui 兼容" setting starts from config and, when on,
+  // dsh-login
   // writes @linxin666/dsh-remote-web-ui's requirePairingForLan to false so
   // non-loopback (public FRP) desktop traffic rides dsh-login's /api channel
   // instead of remote-web-ui's device-pairing gate. No-op if remote-web-ui is
-  // not installed. The toggle is settings-backed + hot-reloaded by that plugin,
-  // so flipping it at runtime takes effect immediately and persists.
+  // not installed. The remote-web-ui plugin reads its own setting per request.
   const remoteWebUiSetting = new BooleanSetting(join(dataDir, 'settings-remote-web-ui.json'), config.remoteWebUiCompat)
   const remoteWebUiCompat = new RemoteWebUiCompat({
     getSettings: () => ctx.get('settings') as unknown as ReturnType<RemoteWebUiCompatDeps['getSettings']>,
   })
   const distIndex = config.distIndex === '' ? resolveDistIndex() : config.distIndex
   const gatewayConfig = { ...config, distIndex }
-  const loginDeps = { users, store, sessionTtl: config.sessionTtl, hosts, autoTrust: config.autoTrustHosts }
+  const publicBaseUrl = config.publicBaseUrl || ctx.webServer.getOrigin()
+  const adminSso = createAdminSso({
+    adminBaseUrl: config.adminBaseUrl.replace(/\/+$/, ''),
+    clientId: config.adminClientId,
+    redirectUri: `${publicBaseUrl.replace(/\/+$/, '')}/api/auth/callback`,
+    sessionTtl: config.sessionTtl,
+    autoTrustHosts: config.autoTrustHosts,
+    hosts,
+  }, store)
 
   // Capture the webRuntime LAN literals so the /api takeover trusts the
   // bound LAN addresses automatically (the shipped connection row read them
@@ -121,8 +118,7 @@ export function apply(ctx: Context, config: Config): void {
   // host session surface lazily (sessionController first, typertGateway as
   // fallback) and the durable workspace registry lazily, because neither
   // service is guaranteed to be registered at dsh-login's apply time. It
-  // reads the defaultWorkspace toggle live so the admin switch binds without
-  // a restart.
+  // reads the persisted defaultWorkspace setting for each request.
   const workspaceRoot = config.workspaceRoot === '' ? join(resolveDshHome(), 'workspaces') : config.workspaceRoot
   const provisioner = new DefaultWorkspaceProvisioner({
     workspaceRoot,
@@ -141,41 +137,29 @@ export function apply(ctx: Context, config: Config): void {
     kind: 'exact',
     path: '/login',
     handler: async (_req, res) => {
-      // No users yet → first-time setup form; otherwise the login form.
-      const html = (await users.isEmpty()) ? renderSetupPage() : renderLoginPage()
+      const html = renderLoginPage()
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       res.end(html)
     },
   }
 
-  const gatewayHandler = createGatewayHandler(ctx, gatewayConfig, store)
+  const gatewayHandler = createGatewayHandler(ctx, gatewayConfig, store, adminSso.userInfo)
 
   ctx.effect(() => ctx.webServer.register(loginPageRoute), 'dsh-login: /login')
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: '/api/auth/setup',
-    handler: createSetupHandler(loginDeps),
-  }), 'dsh-login: /api/auth/setup')
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: '/api/auth/login',
-    handler: createLoginHandler(loginDeps),
-  }), 'dsh-login: /api/auth/login')
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: '/api/auth/logout',
-    handler: createLogoutHandler(store),
-  }), 'dsh-login: /api/auth/logout')
-  // Link-friendly logout: same revocation, but answers with a redirect so
-  // plain <a href="/logout"> entries (e.g. the admin page topbar) work.
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: '/logout',
-    handler: createLogoutRedirectHandler(store),
-  }), 'dsh-login: /logout')
-  for (const route of createAdminRoutes({ users, store, hosts, defaultWorkspaceSetting, remoteWebUiSetting, remoteWebUiCompat, onRemoteWebUiApply: (enabled) => applyWithRetry(remoteWebUiCompat, enabled, config.remoteWebUiPublicBaseUrl, 3, 50) })) {
+  for (const route of adminSso.routes) {
     ctx.effect(() => ctx.webServer.register(route), `dsh-login: ${route.path}`)
   }
+  ctx.provide('dshLoginAuth', {
+    accessToken: adminSso.accessToken,
+    refreshAccessToken: adminSso.refreshAccessToken,
+    isUserAuthenticated: adminSso.isUserAuthenticated,
+    userInfo: adminSso.userInfo,
+    permissionsForUser: (userId: string) => store.permissionsForUser(userId),
+    resolveAgentUserId: (agentSessionId: string) => ownership.lookup(agentSessionId),
+    currentUser: adminSso.currentUser,
+    onLogin: adminSso.onLogin,
+    onLogout: adminSso.onLogout,
+  })
   // Boot-time application of the remote-web-ui compatibility toggle. Deferred
   // so it never blocks startup; applyWithRetry keeps retrying a few hundred ms
   // in case remote-web-ui's settings namespace registers after dsh-login does.
@@ -264,7 +248,7 @@ export function apply(ctx: Context, config: Config): void {
   // GET /api/auth/capabilities, which is authoritative. UI-plugin boot code
   // can read window.__DSH_SESSION__ to skip features the current user cannot
   // use instead of probing (and being denied on) them.
-  const cap = deriveCapabilities({ username: '', isAdmin: false })
+  const cap = deriveCapabilities({ username: '', isAdmin: false, permissions: [] })
   const sessionBaselineScript = `window.__DSH_SESSION__={username:null,isAdmin:false,capabilities:${JSON.stringify(cap)}};`
   ctx.effect(() => ctx.on('webserver/index-inject', (table: Array<{ kind: string; placement: string; text: string }>) => {
     table.push({ kind: 'script', placement: 'head', text: sessionBaselineScript })
@@ -273,5 +257,8 @@ export function apply(ctx: Context, config: Config): void {
   // Teardown: flush any pending ownership-index / trusted-hosts writes to
   // disk. Returning the Promise lets Cordis await it on stop so a freshly
   // learned host (debounce still pending) is not dropped (review #3).
-  ctx.effect(() => () => Promise.all([store.flush(), ownership.flush(), hosts.flush(), defaultWorkspaceSetting.flush(), remoteWebUiSetting.flush()]), 'dsh-login: sessions + ownership + hosts + settings flush')
+  ctx.effect(() => () => {
+    adminSso.clear()
+    return Promise.all([store.flush(), ownership.flush(), hosts.flush(), defaultWorkspaceSetting.flush(), remoteWebUiSetting.flush()])
+  }, 'dsh-login: sessions + ownership + hosts + settings flush')
 }
